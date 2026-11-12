@@ -2,6 +2,8 @@
 
 Use this reference to drive Regimagen from a script or an AI agent. The CLI imports local images, plans a reconstruction, runs Codex ImageGen, and exports local PNG or ZIP files. Each workspace stores its own sources, jobs, preferences, and operation history.
 
+Layered `.regimagen` projects, Generative Fill, and Generative Remove are desktop workflows. To reconstruct an edited composition with the CLI, use **File → Export image** in the desktop app, save a PNG, and import that PNG into your CLI workspace. [Desktop workflow](../README.md#quick-start)
+
 ## Start here
 
 - In the Windows archive, invoke `regimagen-cli.exe` from the extracted folder. Keep `_internal` next to it. From the repository, use `uv run regimagen-cli` after `uv sync --locked --group dev`.
