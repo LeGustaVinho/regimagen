@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from PIL import Image
 
 from .document import Document, Layer, box, paste_pixels, render
-from .fill import FillPreview
+from .fill import FillCandidate, FillPreview, render_fill
 from .geometry import Rect
 
 
@@ -36,6 +36,15 @@ class LayeredVariant:
     document: Document
     layer_id: str
     preview: FillPreview
+    candidate: FillCandidate | None = None
+
+
+def render_layer_fill(
+    document: Document, image: Image.Image, selection: Image.Image, candidate: FillCandidate,
+    target: ActiveFillTarget | None, *, edit_alpha: bool,
+) -> LayeredVariant:
+    preview = render_fill(image, selection, candidate, edit_alpha=edit_alpha)
+    return replace(layered_variant(document, selection, preview, target), candidate=candidate)
 
 
 def layered_variant(
