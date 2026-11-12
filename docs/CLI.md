@@ -99,7 +99,7 @@ $export = Invoke-Regimagen export $job --format png --output '.\rebuilt.png' --r
 | `job refresh-previews JOB_ID [--request-id KEY]` | Rebuild thumbnails in the background. |
 | `job adopt-input JOB_ID` | Record a checksum for the checked PNG of a historical chained job. Verify the `input_path` from `job show` first. The command validates the file and its expected dimensions and preserves an existing checksum. |
 
-The grid supports 2–16 columns and 2–6 rows. `plan` also returns the suggested layout, which uses the fewest tiles needed to reach the maximum resolution for that aspect ratio. Check `layout.enlarges` before submitting generation. The `--file` form can plan without importing.
+Choose at least 2 columns and 2 rows. Both axes can grow as long as every tile covers at least one output pixel and the result fits the PNG format. `plan` suggests the smallest grid that can fit at least 2× the source dimensions. Check that `layout.enlarges` is true and `layout.grid_error` is null before submitting generation. The `--file` form can plan without importing.
 
 Workspace keys are `codex` (an executable path or `auto`), `subagents` (`true` or `false`), `scales` (a list such as `"2x, 4x"`), and `input_mode` (`original` or `previous`). Generation and batch commands can override the Codex path and subagent setting for the run.
 
@@ -107,10 +107,10 @@ Workspace keys are `codex` (an executable path or `auto`), `subagents` (`true` o
 
 - `prompt get JOB_ID [--tile COLUMN ROW]`, `prompt clear JOB_ID [--tile COLUMN ROW]`, and `prompt set JOB_ID [--tile COLUMN ROW] (--text TEXT | --file FILE | --stdin)`. Omit `--tile` for the global prompt. Tile prompts take precedence.
 - `generate JOB_ID` submits all pending tiles. Use `--preview [--anchor COLUMN ROW]` for a 2×2 region or repeat `--tile COLUMN ROW` to select specific tiles. Combine `--regenerate` with an explicit tile selection to replace current results.
-- Generation accepts `--dry-run`, `--codex PATH_OR_AUTO`, `--subagents` or `--no-subagents`, and `--request-id KEY`. A dry run returns `selected`, `pending`, `reused`, and `max_edits` without starting a worker.
+- Generation accepts `--dry-run`, `--codex PATH_OR_AUTO`, `--subagents` or `--no-subagents`, and `--request-id KEY`. A dry run returns `selected`, `pending`, `reused`, `transparent`, and `max_edits` without starting a worker. The `transparent` list contains pending tiles with zero source alpha across their contribution to the output, including overlap. Regimagen completes those tiles locally, includes them in exports, and excludes them from `max_edits`.
 - `batch start SOURCE_ID --output-dir DIR [--scales SCALE ...] [--input-mode original|previous]` runs and exports scale stages. It accepts the same Codex, subagent, and request-ID flags. Choose at most one of `--prompt-file FILE` and `--prompt-from-job JOB_ID`. The prompt job must use the same source.
 
-Scales are integer multiples of the original image dimensions, even in `previous` mode. For `2 4`, that mode uses the completed 2× PNG as the input to the 4× stage and requires ascending scales. `original` uses the original image at every stage. If a batch has no prompt override, saved stage prompts are reused. The operation reports verified output paths and the input revision for each stage. If the current chain's cache needs repair, rerun the same batch. To recover an intact older PNG for a specific historical stage, use `job adopt-input` after checking that file.
+Scales are integer multiples of the original image dimensions, starting at 2×. The reported `max_scale` is the PNG format limit for those dimensions. For `2 4`, `previous` mode uses the completed 2× PNG as the input to the 4× stage and requires ascending scales. `original` uses the original image at every stage. If a batch has no prompt override, saved stage prompts are reused. The operation reports verified output paths and the input revision for each stage. If the current chain's cache needs repair, rerun the same batch. To recover an intact older PNG for a specific historical stage, use `job adopt-input` after checking that file.
 
 ### Inspect and export
 

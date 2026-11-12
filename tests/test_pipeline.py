@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
-from regimagen.codex import Cancelled, CodexClient, CodexError, GeneratedImage, QuotaPaused, find_codex
+from regimagen.codex import Cancelled, CodexClient, CodexError, GeneratedImage, ImageTurnRejected, QuotaPaused, find_codex
 from regimagen.composite import Compositor, export_parts, export_png
 from regimagen.files import TRANSPARENT_MATTE, load_generated, load_source
 from regimagen.geometry import FRAME, Cell, Grid, Layout, Rect, parse_scales, plan_scales, scaled_grid
@@ -229,8 +229,9 @@ def test_scaled_jobs_and_transparent_parts(tmp_path):
     source = store.import_source(image, "sprite.png")
     assert parse_scales("2x, 3 ×; 4 2") == (2, 3, 4)
     assert scaled_grid(1000, 500, 2) == Grid(3, 2)
-    with pytest.raises(ValueError):
-        scaled_grid(1000, 500, 11)
+    assert scaled_grid(1000, 500, 18) == Grid(21, 11)
+    with pytest.raises(ValueError, match="at least 2"):
+        scaled_grid(1000, 500, 1)
     jobs = [store.ensure_job(source, scaled_grid(*image.size, scale), scale) for scale in (2, 3)]
     assert jobs[0].grid == jobs[1].grid
     assert jobs[0].id != jobs[1].id
@@ -357,6 +358,25 @@ def test_scale_batch_uses_previous_export_and_resumes_by_input(tmp_path, monkeyp
     replacement = rendered[-1]
     assert replacement.id != second.id and replacement.input_path != second.input_path
     assert second.input_path.is_file()
+
+
+def test_fully_transparent_scale_batch_does_not_resolve_codex(tmp_path):
+    store = Store(tmp_path)
+    image = Image.new("RGBA", (32, 20), (123, 45, 67, 0))
+    source = store.import_source(image, "blank.png")
+    layouts = plan_scales(*image.size, "2x, 4x", chained=True)
+
+    def unexpected_codex():
+        pytest.fail("A fully transparent batch must not resolve Codex.")
+
+    folder, completed, total = run_scale_batch(
+        store, source, layouts, unexpected_codex, tmp_path, pause=Event(), cancelled=Event(),
+    )
+    assert completed == total == 2
+    for layout in layouts:
+        with Image.open(folder / f"blank-{layout.scale}x.png") as result:
+            assert result.size == layout.size
+            assert result.mode == "RGBA" and result.getchannel("A").getbbox() is None
 
 
 @pytest.mark.parametrize(("grid", "source_size"), [
@@ -531,6 +551,84 @@ def test_image_decode_and_event_provenance(tmp_path):
     assert load_source(alpha).mode == "RGBA"
     with pytest.raises(ValueError, match="opaque"):
         load_generated(alpha.read_bytes())
+
+
+@pytest.mark.parametrize(("reported", "verified"), [
+    pytest.param((0, 1, 2), True, id="all-inputs-in-order"),
+    pytest.param(None, None, id="older-event-without-inputs"),
+    pytest.param((0, 1, None), None, id="hash-unavailable"),
+    pytest.param((), False, id="no-inputs"),
+    pytest.param((0, 1), False, id="omitted-context"),
+    pytest.param((0, 2, 1), False, id="changed-order"),
+    pytest.param((0, 1, 3), False, id="replaced-context"),
+    pytest.param((0, 1, 2, 3), False, id="unexpected-input"),
+])
+def test_generate_verifies_ordered_context_references(tmp_path, reported, verified):
+    paths = tuple(tmp_path / f"input-{index}.png" for index in range(4))
+    for index, path in enumerate(paths):
+        path.write_bytes(png_bytes((16, 16), (index, 20, 30)))
+    hashes = tuple(hashlib.sha256(path.read_bytes()).hexdigest() for path in paths)
+    generated = tmp_path / "result.png"
+    generated.write_bytes(png_bytes((16, 16)))
+
+    class ContextClient(CodexClient):
+        def _run_turn(self, inputs, wait, **_options):
+            assert inputs[1:] == [{"type": "localImage", "path": str(path)} for path in paths[:3]]
+            item = {"type": "imageGeneration", "status": "completed", "savedPath": str(generated)}
+            if reported is not None:
+                item["inputImages"] = [
+                    {"sha256": hashes[index]} if index is not None else {} for index in reported
+                ]
+            return wait("thread", "turn", [
+                {"method": "item/completed", "params": {"threadId": "thread", "turnId": "turn", "item": item}},
+                {"method": "turn/completed", "params": {
+                    "threadId": "thread", "turn": {"id": "turn", "status": "completed"},
+                }},
+            ])
+
+    client = ContextClient(Path("codex.exe"), tmp_path)
+    client.generated_dir = tmp_path.resolve()
+    if verified is False:
+        with pytest.raises(ImageTurnRejected, match="context references"):
+            client.generate("Edit the crop.", paths[:3], verify_references=True)
+    else:
+        result = client.generate("Edit the crop.", paths[:3], verify_references=True)
+        assert result.references_verified is verified
+        assert result.data == generated.read_bytes()
+
+
+@pytest.mark.parametrize(("answer", "status", "failure"), [
+    ('{"targets":[]}', "completed", None),
+    ("invalid response", "completed", CodexError),
+    ('{"targets":[]}', "interrupted", Cancelled),
+])
+def test_object_analysis_uses_the_final_structured_response(tmp_path, answer, status, failure):
+    image = tmp_path / "selection.png"
+    schema = {"type": "object"}
+
+    class AnalysisClient(CodexClient):
+        def _run_turn(self, inputs, wait, *, output_schema):
+            assert output_schema == schema
+            assert inputs[1] == {"type": "localImage", "path": str(image.resolve())}
+            events = [
+                {"method": "item/completed", "params": {
+                    "threadId": "thread", "turnId": "turn", "item": {
+                        "type": "agentMessage", "phase": phase, "text": text,
+                    },
+                }}
+                for phase, text in (("commentary", "Inspecting the image"), ("final_answer", answer))
+            ]
+            events.append({"method": "turn/completed", "params": {
+                "threadId": "thread", "turn": {"id": "turn", "status": status},
+            }})
+            return wait("thread", "turn", events)
+
+    client = AnalysisClient(Path("codex.exe"), tmp_path, image_generation=False)
+    if failure is None:
+        assert client.analyze_images("Find objects.", (image,), schema) == {"targets": []}
+    else:
+        with pytest.raises(failure):
+            client.analyze_images("Find objects.", (image,), schema)
 
 
 def test_transparent_input_keeps_coverage_in_preview_and_export(tmp_path):

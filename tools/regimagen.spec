@@ -1,11 +1,15 @@
 from pathlib import Path
 
 from PyInstaller.utils.hooks import copy_metadata
+from regimagen.remove_model import model_path
 
 
 root = Path(SPECPATH).parent
 package = root / "regimagen"
-data = [(str(package / "assets"), "regimagen/assets")]
+data = [
+    (str(package / "assets"), "regimagen/assets"),
+    (str(model_path()), "regimagen/assets"),
+]
 for dependency in ("PySide6-Essentials", "shiboken6", "numpy", "Pillow", "opencv-python-headless", "pypng"):
     data.extend(copy_metadata(dependency))
 

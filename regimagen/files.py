@@ -3,11 +3,13 @@
 import io
 import os
 import tempfile
+import zlib
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
 
+import png
 from PIL import Image, ImageCms, ImageOps, UnidentifiedImageError
 
 from .geometry import FRAME
@@ -20,6 +22,19 @@ TRANSPARENT_MATTE = (30, 33, 39)
 
 class InvalidStageInput(ValueError):
     code = "INVALID_STAGE_INPUT"
+
+
+class SrgbPngWriter(png.Writer):
+    def __init__(self, *args, embed_profile: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._embed_profile = embed_profile
+
+    def write_preamble(self, stream):
+        super().write_preamble(stream)
+        if self._embed_profile:
+            png.write_chunk(stream, b"iCCP", b"ICC Profile\x00\x00" + zlib.compress(SRGB_BYTES))
+        else:
+            png.write_chunk(stream, b"sRGB", b"\x00")
 
 
 @contextmanager

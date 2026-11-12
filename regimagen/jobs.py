@@ -1,11 +1,12 @@
-"""Queue ImageGen edits and recover previously received results."""
+"""Complete transparent tiles locally and queue or recover ImageGen edits."""
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from hashlib import file_digest, sha256
 import json
 from itertools import batched
+from math import ceil
 from pathlib import Path
 from shutil import copyfileobj
 from tempfile import TemporaryDirectory, mkdtemp
@@ -19,8 +20,11 @@ from .codex import (
     AGENT_GROUP_SIZE, AuthRequired, Cancelled, CodexClient, CodexError, GeneratedImage, ImageTurnRejected, QuotaPaused,
 )
 from .composite import Compositor, export_png
-from .files import InvalidStageInput, atomic_output, load_generated, load_source, reference_rgb, save_png
-from .geometry import Cell, Layout
+from .files import (
+    TRANSPARENT_MATTE, InvalidStageInput, alpha_channel, atomic_output, load_generated, load_source,
+    reference_rgb, save_png,
+)
+from .geometry import FRAME, Cell, Layout, Rect
 from .imaging import (
     EDIT_PROMPT, REPAIR_PROMPT, align_tile, prepare_frame, read_tile, seam_warning, write_references,
 )
@@ -116,14 +120,41 @@ def adopt_job_input(job: Job) -> str:
     return digest
 
 
+def transparent_cells(layout: Layout, image: Image.Image) -> set[Cell]:
+    alpha = alpha_channel(image)
+    if alpha is None:
+        return set()
+    occupied = alpha.getbbox()
+    if occupied is None:
+        return set(layout.cells)
+    content = Rect(*occupied)
+    width, height = layout.size
+    source_width, source_height = image.size
+    support = layout.band(SEAM_MARGIN)
+    transparent = set()
+    for cell in layout.cells:
+        area = layout.core(cell).expand(*support).intersect(layout.bounds)
+        assert area is not None
+        # Include adjacent source samples used to reconstruct alpha at the boundary.
+        box = Rect(
+            area.left * source_width // width - 1,
+            area.top * source_height // height - 1,
+            ceil(area.right * source_width / width) + 1,
+            ceil(area.bottom * source_height / height) + 1,
+        ).intersect(content)
+        if box is None or alpha.crop((box.left, box.top, box.right, box.bottom)).getbbox() is None:
+            transparent.add(cell)
+    return transparent
+
+
 def prepare_tile_request(
     directory: Path, original: Image.Image, frame: np.ndarray, layout: Layout, cell: Cell,
-    snapshot: Snapshot, *, sprite: bool,
+    snapshot: Snapshot, *, sprite: bool, transparent: set[Cell],
 ) -> tuple[str, tuple[Path, ...]]:
     repair = {
         neighbor: tile.artifact
         for neighbor in layout.neighbors(cell)
-        if (tile := snapshot.tiles[neighbor]).artifact is not None
+        if neighbor not in transparent and (tile := snapshot.tiles[neighbor]).artifact is not None
         and not (tile.alignment_warning or tile.stale)
     }
     inputs = write_references(directory, original, frame, layout, cell, repair)
@@ -152,13 +183,15 @@ def run_tiles(
     input_image: Image.Image | None = None,
 ) -> RunOutcome:
     layout = job.layout
+    if layout.grid_error:
+        raise ValueError(layout.grid_error)
     if not layout.enlarges:
         raise ValueError("The selected grid must enlarge the image in both dimensions.")
     job.folder.mkdir(exist_ok=True)
     imported = input_image if input_image is not None else load_job_input(job)
     alpha = imported if imported.mode == "RGBA" else None
-    original = reference_rgb(imported)
-    source = np.asarray(original)
+    transparent = transparent_cells(layout, imported)
+    original = None
     store.set_notice(job, None)
 
     with ExitStack() as stack:
@@ -181,6 +214,12 @@ def run_tiles(
                         store.begin_tile(job, current, attempt)
                         on_change(current)
                         staged = job.folder / f"{attempt}.image"
+                        if current in transparent:
+                            _commit_tile(store, job, current, attempt, staged, None, None, alpha, None)
+                            continue
+                        if original is None:
+                            original = reference_rgb(imported)
+                            source = np.asarray(original)
                         frame = prepare_frame(source, layout, current)
                         attempts[current] = (attempt, staged, frame)
                         if staged.is_file():
@@ -195,7 +234,8 @@ def run_tiles(
                             TemporaryDirectory(dir=job.folder, prefix="reference-")
                         )
                         prompt, inputs = prepare_tile_request(
-                            Path(directory), original, frame, layout, current, snapshot, sprite=alpha is not None,
+                            Path(directory), original, frame, layout, current, snapshot,
+                            sprite=alpha is not None, transparent=transparent,
                         )
                         queued.append((current, prompt, inputs))
 
@@ -215,6 +255,7 @@ def run_tiles(
 
                     failure = None
                     if queued:
+                        current = queued[0][0]
                         if client is None:
                             options = {"subagents": True} if subagents else {}
                             path = executable() if callable(executable) else executable
@@ -246,7 +287,10 @@ def run_tiles(
                 for current, image in generated.items():
                     on_change(current)
                     attempt, staged, frame = attempts[current]
-                    _commit_tile(store, job, current, attempt, staged, frame, image, alpha, generation_ids.get(current))
+                    _commit_tile(
+                        store, job, current, attempt, staged, frame, image, alpha, generation_ids.get(current),
+                        transparent=transparent,
+                    )
                 if failure is not None and len(generated) < len(attempts):
                     current = next(cell for cell in attempts if cell not in generated)
                     raise failure
@@ -377,18 +421,27 @@ def run_scale_batch(
     return folder, completed, len(layouts)
 
 
-def _commit_tile(store, job, cell, attempt, staged, frame, generated, alpha, generation_id):
+def _commit_tile(
+    store, job, cell, attempt, staged, frame, generated, alpha, generation_id, *,
+    transparent: Collection[Cell] = (),
+):
     layout = job.layout
     snapshot = store.snapshot(job)
     previous = snapshot.tiles[cell]
-    corrected, warning = align_tile(generated, frame, layout, cell)
-    notes = {
-        neighbor: seam_warning(layout, cell, neighbor, corrected, read_tile(path))
-        for neighbor in layout.neighbors(cell)
-        if (path := snapshot.tiles[neighbor].artifact) is not None
-    }
+    notes = dict.fromkeys(layout.neighbors(cell))
+    if generated is None:
+        # The compositor restores alpha for both previews and exports.
+        image = Image.new("RGB", (FRAME, FRAME), TRANSPARENT_MATTE)
+        warning = None
+    else:
+        corrected, warning = align_tile(generated, frame, layout, cell)
+        for neighbor in notes:
+            path = snapshot.tiles[neighbor].artifact
+            if neighbor not in transparent and path is not None:
+                notes[neighbor] = seam_warning(layout, cell, neighbor, corrected, read_tile(path))
+        image = Image.fromarray(corrected)
     path = job.folder / f"{attempt}.png"
-    save_png(Image.fromarray(corrected), path)
+    save_png(image, path)
     store.finish_tile(job, cell, attempt, generation_id, warning, notes)
     refresh_thumbnails(store, job, changed=None if snapshot.previews_dirty else cell, alpha=alpha)
     old_thumbnail = thumbnail_path(previous.artifact) if previous.artifact else None

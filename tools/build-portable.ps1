@@ -19,6 +19,9 @@ try {
     }
     $regimagenBuild = Join-Path $regimagenRoot 'build'
     New-Item -ItemType Directory -Path $regimagenBuild -Force | Out-Null
+    uv run python -m regimagen.remove_model
+    if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the object selection model.' }
+
     $regimagenIcon = Join-Path $regimagenBuild 'Regimagen.ico'
     uv run python -c "import sys; from PySide6.QtWidgets import QApplication; from regimagen.app import logo; app=QApplication([]); assert logo(64).save(sys.argv[1], 'ICO')" $regimagenIcon
     if ($LASTEXITCODE -ne 0) { throw 'Could not generate the application icon.' }

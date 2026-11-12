@@ -54,10 +54,10 @@ class ImageView(QGraphicsView):
         rect = self.sceneRect()
         if rect.isEmpty():
             return 1.0
-        return max(0.001, min(
-            (self.viewport().width() - 24) / rect.width(),
-            (self.viewport().height() - 24) / rect.height(),
-        ))
+        return min(
+            max(1, self.viewport().width() - 24) / rect.width(),
+            max(1, self.viewport().height() - 24) / rect.height(),
+        )
 
     def zoom(self, factor: float, position=None):
         if self.sceneRect().isEmpty():
@@ -158,20 +158,26 @@ class Comparison(QWidget):
         panels = QSplitter(Qt.Orientation.Horizontal)
         panels.setChildrenCollapsible(False)
         self.before_title = QLabel("Original")
-        panels.addWidget(self._panel(self.before_title, self.before))
+        self.fill_button = QPushButton("Generative Fill…")
+        self.fill_button.setToolTip("Select and edit an area of the source image at its original size.")
+        panels.addWidget(self._panel(self.before_title, self.before, self.fill_button))
         panels.addWidget(self._panel(QLabel("Reconstruction"), self.after))
         panels.setSizes([500, 500])
         content.addWidget(panels, 1)
 
     @staticmethod
-    def _panel(title: QLabel, view: ImageView) -> QWidget:
+    def _panel(title: QLabel, view: ImageView, action: QPushButton | None = None) -> QWidget:
         panel = QFrame()
         panel.setObjectName("imagePanel")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(1, 1, 1, 1)
         layout.setSpacing(0)
         title.setObjectName("imageTitle")
-        layout.addWidget(title)
+        header = QHBoxLayout()
+        header.addWidget(title, 1)
+        if action is not None:
+            header.addWidget(action)
+        layout.addLayout(header)
         layout.addWidget(view, 1)
         return panel
 

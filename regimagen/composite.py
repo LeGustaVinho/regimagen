@@ -10,11 +10,10 @@ from zipfile import ZipFile
 
 import cv2
 import numpy as np
-import png
 from PIL import Image
 
 from .codex import Cancelled
-from .files import SRGB_BYTES, atomic_output
+from .files import SRGB_BYTES, SrgbPngWriter, atomic_output
 from .geometry import FRAME, Cell, Layout, Rect
 from .imaging import read_tile
 from .matte import SpriteMatte
@@ -214,12 +213,6 @@ class Compositor:
                          borderMode=cv2.BORDER_REFLECT_101)
 
 
-class _SrgbWriter(png.Writer):
-    def write_preamble(self, stream):
-        super().write_preamble(stream)
-        png.write_chunk(stream, b"sRGB", b"\x00")
-
-
 def render_part(layout: Layout, cell: Cell, artifact: Path, *, alpha: Image.Image | None = None):
     core = layout.core(cell)
     area = core.expand(*layout.band()).intersect(layout.bounds)
@@ -289,6 +282,6 @@ def export_png(
             progress(bottom, height)
 
     with atomic_output(destination, overwrite=overwrite, before_publish=before_publish) as stream:
-        _SrgbWriter(width, height, greyscale=False, alpha=alpha is not None, compression=3).write(stream, rows())
+        SrgbPngWriter(width, height, greyscale=False, alpha=alpha is not None, compression=3).write(stream, rows())
         if cancelled():
             raise Cancelled("Export canceled.")

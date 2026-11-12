@@ -5,31 +5,36 @@
 [![CLI JSON schema v1](https://img.shields.io/badge/CLI-JSON%20v1-2EA043)](docs/CLI.md)
 [![Python 3.14](https://img.shields.io/badge/Python-3.14-3776AB?logo=python&logoColor=white)](#develop-from-source)
 
-**Generative image reconstruction with Codex ImageGen.** Regimagen divides a source image into overlapping tiles, regenerates them with new visual detail, and blends the results into a lossless sRGB PNG. Review the reconstruction in the Windows app or automate it through the JSON CLI.
+**Layered image editing and generative reconstruction with Codex ImageGen.** Compose and retouch images in the Windows app, apply Generative Fill to a selection, or reconstruct the visible composition at a larger size. The JSON CLI automates reconstruction and tile export.
 
 [Download Windows ZIP](https://github.com/LeGustaVinho/regimagen/releases/latest/download/Regimagen-Windows-x64.zip) · [CLI reference](docs/CLI.md) · [Report an issue](https://github.com/LeGustaVinho/regimagen/issues/new)
 
 ![Regimagen desktop with the original image, a four-tile reconstruction preview, and the job controls](docs/assets/desktop.png)
 
-*The desktop app showing a 2×2 preview within a 4×4 job, using simulated tiles.*
+*Reconstruction mode showing a 2×2 preview within a 4×4 job, using simulated tiles.*
 
 ## Features
 
-- **Configurable reconstruction.** Choose 2–16 columns and 2–6 rows. Regimagen previews the output size and tile count before generation.
+- **Canvas and layers.** Move, reorder, duplicate, hide, and lock layers. Use rectangular and lasso selections to crop the canvas or work on part of a layer. Save editable layers, masks, and pixels together in a portable `.regimagen` project.
+- **Manual retouching.** Paint pixels or masks with the brush and eraser. Rotate, flip, and resize layers, or preview brightness, contrast, and saturation adjustments. Undo and redo edits in the current session. Export the composition as PNG or WebP with transparency, or JPEG with a white background.
+- **Generative Fill.** Choose **New layer** to use the visible composition, or **Active layer** to edit a visible, unlocked raster layer. Select an area, describe the edit, and compare variations before applying. Turn on **Edit Transparency** to add or remove coverage. To reduce the selection of a previously saved image version, open it from **Recent** and choose **Image version → Reopen fill**.
+- **Generative Remove.** Click an object or draw around it with **Lasso**, check the outline, and choose **Remove**. Use **Refine selection** to adjust the area or detect related objects, shadows, and reflections. EfficientSAM proposes outlines on the CPU, and Codex handles ambiguous selections and reconstructs covered surfaces. Exposed transparent areas can be cleared locally. Applying a variation adds a separate layer to the document.
+- **Configurable reconstruction.** Choose at least 2 columns and 2 rows. Regimagen previews the output size and tile count before generation and suggests the smallest grid that can fit at least 2× the source dimensions.
 - **Reusable 2×2 previews.** Check a four-tile region before running the full grid. The full job reuses completed tiles from the same grid.
 - **Art direction and review.** Set a global prompt and per-tile overrides, inspect seams with synchronized zoom, and regenerate individual tiles.
 - **Scale batches.** Generate exact multiples of the original size. Each stage can use the original input or the preceding stage's result.
-- **Flexible exports.** Export a lossless PNG with source transparency, or a ZIP of completed tiles with placement metadata. The CLI can also export an individual tile.
+- **Flexible exports.** Export a lossless PNG with source transparency, or a ZIP of completed tiles with placement metadata. Fully transparent tiles are completed locally and included in both exports. The CLI can also export an individual tile.
 - **Local checkpoints.** Completed tiles and prompts are saved in the workspace. Pause or resume long jobs and enable Codex subagents when you want parallel generation.
 
-Generated tiles may differ from the source or neighboring tiles. Use the preview and seam review to check the result before committing to a large grid. Regimagen sends tile and reference images to Codex for generation under your account and its usage limits.
+Use the preview and seam review to check generated tiles before committing to a large grid. Regimagen sends image references to Codex under your account when it requests generation or visual analysis.
 
 ## Quick start
 
 1. Download `Regimagen-Windows-x64.zip` from the latest release and extract the whole folder. Keep `_internal` beside the executables. The ZIP bundles the Python runtime and application dependencies.
-2. Install Codex CLI and run `codex login` with your ChatGPT account. If automatic detection misses it, select the executable from the desktop app's **Codex CLI** menu. [Codex CLI documentation](https://developers.openai.com/codex/cli/)
-3. Open `Regimagen.exe` on Windows 10 or 11 x64. Drop in a still PNG, JPEG, or WebP and review the proposed grid.
-4. Run **Generate 2×2 preview**, inspect the result, then choose **Generate image**. Use **Export PNG** for the complete image or **Export tiles (ZIP)** for manual assembly.
+2. Open `Regimagen.exe` on Windows 10 or 11 x64. Drop in a still PNG, JPEG, WebP, or `.regimagen` project. To start from transparency, choose **New canvas**.
+3. Use **Add layer** to import another image or create a paintable layer. Choose **File → Save project** to keep your layers, or **File → Export image** to publish the composition.
+4. To use **Generative Fill** or **Reconstruct**, install Codex CLI and run `codex login`. If automatic detection misses it, choose the executable from the **Codex CLI** menu. [Codex CLI documentation](https://developers.openai.com/codex/cli/)
+5. In **Reconstruct**, run **Generate 2×2 preview**, inspect the result, then choose **Generate image**. Use **Open result in editor** to work on the completed image at its generated size. You can also export the PNG or a ZIP of tiles.
 
 ## CLI and AI automation
 
@@ -52,7 +57,7 @@ uv run regimagen-cli capabilities
 uv run pytest -q
 ```
 
-The test suite covers geometry, compositing, saved-job compatibility, and CLI recovery using simulated ImageGen results. The optional `tools/validate_imagegen.py` script runs a live check and uses your Codex quota. See `--help` for its options.
+The test suite covers the editor, portable projects, compositing, saved-job compatibility, and CLI recovery using simulated ImageGen results. The optional `tools/validate_imagegen.py` script runs a live check and uses your Codex quota. See `--help` for its options.
 
 Build the portable archive with `.\tools\build-portable.ps1`. The build writes `dist\Regimagen-Windows-x64.zip` with the desktop app, CLI, and bundled documentation.
 

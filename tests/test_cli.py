@@ -91,8 +91,13 @@ def test_discover_import_plan_and_saved_jobs(command, sprite, tmp_path):
     assert invoke("job", "create", sid, "--grid", 2, 2)["job_id"] != jid
     assert len(invoke("job", "list", "--source", sid)["jobs"]) == 2
     assert invoke("job", "show", "missing", error="NOT_FOUND")
-    assert invoke("job", "create", sid, "--grid", 17, 6, error="INVALID_ARGUMENT")
+    larger = invoke("job", "create", sid, "--grid", 24, 18)
+    assert larger["grid"] == {"columns": 24, "rows": 18}
+    assert invoke("tile", "show", larger["job_id"], 24, 18)["column"] == 24
+    assert invoke("job", "create", sid, "--grid", 1, 18, error="INVALID_ARGUMENT")
+    assert invoke("plan", sid, "--grid", 5000, 2)["layout"]["grid_error"]
     assert invoke("plan", sid, "--scales", "2x,4x", "--input-mode", "previous")["stages"][1]["input_scale"] == 2
+    assert invoke("plan", sid, "--scales", 900)["stages"][0]["grid"] == {"columns": 41, "rows": 25}
     assert invoke("plan", sid, "--scales", 4, 2, "--input-mode", "previous", error="INVALID_ARGUMENT")
 
     large = tmp_path / "large.png"
@@ -454,6 +459,43 @@ def provider(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "run_tiles", generate)
     monkeypatch.setattr(jobs, "run_tiles", generate)
     return image_provider
+
+
+def test_transparent_tiles_skip_subagents_and_remain_exportable(controlled_worker, provider, tmp_path):
+    _, invoke, run_next = controlled_worker
+    path = tmp_path / "alpha.png"
+    image = Image.new("RGBA", (200, 200), (230, 180, 150, 0))
+    ImageDraw.Draw(image).rectangle((20, 20, 45, 50), fill=(130, 150, 170, 255))
+    # Only the blend margin of the lower-left tile contains this faint pixel.
+    image.putpixel((40, 95), (130, 150, 170, 1))
+    image.save(path)
+    _, job = import_job(invoke, path)
+    jid = job["job_id"]
+
+    plan = invoke("generate", jid, "--preview", "--dry-run")
+    assert len(plan["pending"]) == 4
+    assert [(tile["column"], tile["row"]) for tile in plan["transparent"]] == [(2, 1), (2, 2)]
+    assert plan["max_edits"] == 2
+
+    oid = invoke("generate", jid, "--preview", "--subagents")["operation_id"]
+    run_next()
+    status = invoke("operation", "status", oid)
+    assert status["state"] == "completed" and status["progress"]["completed"] == 4
+    assert len(provider.calls) == 2
+    assert invoke("tile", "show", jid, 2, 1)["generation_id"] is None
+    assert len(invoke("generate", jid, "--dry-run")["reused"]) == 4
+    assert invoke("generate", jid, "--tile", 2, 1, "--regenerate", "--dry-run")["max_edits"] == 0
+    oid = invoke("generate", jid, "--tile", 2, 1, "--regenerate")["operation_id"]
+    run_next()
+    assert invoke("operation", "status", oid)["state"] == "completed"
+    assert len(provider.calls) == 2
+
+    output = tmp_path / "transparent-tile.png"
+    oid = invoke("export", jid, "--format", "tile-png", "--tile", 2, 1, "--output", output)["operation_id"]
+    run_next()
+    assert invoke("operation", "status", oid)["state"] == "completed"
+    with Image.open(output) as tile:
+        assert tile.mode == "RGBA" and tile.getchannel("A").getbbox() is None
 
 
 def test_preview_quota_reuse_and_selected_regeneration(controlled_worker, sprite, provider, tmp_path):

@@ -12,14 +12,14 @@ from .composite import Compositor, MISSING_RGB, STRIPE_HEIGHT
 from .files import atomic_output, load_source, reference_rgb, save_png
 from .geometry import Cell, Rect
 from .imaging import prepare_frame
-from .jobs import load_job_input, prepare_tile_request
+from .jobs import load_job_input, prepare_tile_request, transparent_cells
 from .seams import seam_region
 from .storage import Job, Snapshot
 
 
 def cell_at(job: Job, position) -> Cell:
     cell = Cell(position[0] - 1, position[1] - 1)
-    if cell not in job.layout.cells:
+    if not (0 <= cell.column < job.grid.columns and 0 <= cell.row < job.grid.rows):
         raise ValueError("The tile coordinates are outside the grid.")
     return cell
 
@@ -174,6 +174,7 @@ def save_references(job: Job, snapshot: Snapshot, cell: Cell, directory: Path, *
     with TemporaryDirectory() as scratch:
         prompt, images = prepare_tile_request(
             Path(scratch), original, frame, job.layout, cell, snapshot, sprite=source.mode == "RGBA",
+            transparent=transparent_cells(job.layout, source),
         )
         prompt_file = Path(scratch) / "prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")

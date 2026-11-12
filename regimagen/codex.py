@@ -50,6 +50,18 @@ class QuotaPaused(CodexError):
 class GeneratedImage:
     data: bytes
     generation_id: str | None
+    references_verified: bool | None = None
+
+
+def _verify_reference_hashes(observed: object, expected: tuple[str, ...]) -> bool | None:
+    if not isinstance(observed, list):
+        return None
+    hashes = tuple(image.get("sha256") if isinstance(image, dict) else None for image in observed)
+    if len(hashes) != len(expected) or any(
+        actual is not None and actual != requested for actual, requested in zip(hashes, expected)
+    ):
+        raise ImageTurnRejected("ImageGen used different context references. Generate another variation.")
+    return True if hashes == expected else None
 
 
 def find_codex() -> Path | None:
@@ -112,12 +124,14 @@ class CodexClient:
         cancelled: threading.Event | None = None,
         timeout: float = 600,
         subagents: bool = False,
+        image_generation: bool = True,
     ):
         self.executable = executable
         self.cwd = cwd
         self.cancelled = cancelled or threading.Event()
         self.timeout = timeout
         self.subagents = subagents
+        self.image_generation = image_generation
         self.process: subprocess.Popen | None = None
         self.messages: queue.Queue[dict | Exception | None] = queue.Queue()
         self.next_id = 0
@@ -125,7 +139,8 @@ class CodexClient:
 
     def __enter__(self) -> CodexClient:
         args = [
-            str(self.executable), "app-server", "--stdio", "--enable", "image_generation",
+            str(self.executable), "app-server", "--stdio",
+            "--enable" if self.image_generation else "--disable", "image_generation",
             "--disable", "shell_tool", "--disable", "unified_exec", "--disable", "apps",
             "--disable", "plugins", "--disable", "hooks",
             "-c", 'web_search="disabled"',
@@ -234,11 +249,18 @@ class CodexClient:
     def generate(
         self, prompt: str, references: tuple[Path, ...] = (), *,
         on_image: Callable[[GeneratedImage], None] | None = None,
+        verify_references: bool = False,
     ) -> GeneratedImage:
         attachments = [{"type": "localImage", "path": str(path.resolve())} for path in references]
+        expected_hashes = (
+            tuple(hashlib.sha256(path.read_bytes()).hexdigest() for path in references)
+            if verify_references else None
+        )
         return self._run_turn(
             [{"type": "text", "text": prompt}, *attachments],
-            lambda thread, turn, events: self._wait_image(thread, turn, events, references, on_image=on_image),
+            lambda thread, turn, events: self._wait_image(
+                thread, turn, events, references, on_image=on_image, expected_hashes=expected_hashes,
+            ),
         )
 
     def generate_delegated(
@@ -264,7 +286,47 @@ class CodexClient:
             effort="low",
         )
 
-    def _run_turn(self, inputs: list[dict], wait: Callable, *, effort: str | None = None):
+    def analyze_images(self, prompt: str, references: tuple[Path, ...], schema: dict) -> dict:
+        attachments = [{"type": "localImage", "path": str(path.resolve())} for path in references]
+        return self._run_turn(
+            [{"type": "text", "text": prompt}, *attachments], self._wait_analysis,
+            output_schema=schema,
+        )
+
+    def _wait_analysis(self, thread_id: str, turn_id: str, events: list[dict]) -> dict:
+        deadline = time.monotonic() + self.timeout
+        early = iter(events)
+        answer = ""
+        while True:
+            message = next(early, None) or self._receive(deadline)
+            params = message.get("params", {})
+            if params.get("threadId") != thread_id:
+                continue
+            if params.get("turnId") == turn_id:
+                if message.get("method") == "error" and not params.get("willRetry"):
+                    _raise_codex_error(params.get("error") or {})
+                item = params.get("item", {})
+                if (message.get("method") == "item/completed" and item.get("type") == "agentMessage"
+                        and item.get("phase") in (None, "final_answer", "finalAnswer")):
+                    answer = item.get("text", "")
+            turn = params.get("turn", {})
+            if message.get("method") != "turn/completed" or turn.get("id") != turn_id:
+                continue
+            if turn.get("status") == "interrupted":
+                raise Cancelled("Object detection canceled.")
+            if turn.get("status") != "completed":
+                _raise_codex_error(turn.get("error") or {})
+            try:
+                result = json.loads(answer)
+                if isinstance(result, dict):
+                    return result
+            except (TypeError, ValueError):
+                pass
+            raise CodexError("Codex returned invalid object detection data. Try again or use the selection manually.")
+
+    def _run_turn(
+        self, inputs: list[dict], wait: Callable, *, effort: str | None = None, output_schema: dict | None = None,
+    ):
         thread = self._call("thread/start", {
             "cwd": str(self.cwd), "ephemeral": True, "approvalPolicy": "never",
             "sandbox": "read-only", "modelProvider": "openai", "serviceName": "regimagen",
@@ -279,6 +341,8 @@ class CodexClient:
             params = {"threadId": thread_id, "input": inputs}
             if effort:
                 params["effort"] = effort
+            if output_schema is not None:
+                params["outputSchema"] = output_schema
             turn_id = self._call("turn/start", params, events).get("turn", {}).get("id")
             if not turn_id:
                 raise CodexError("The Codex CLI did not start the editing turn.")
@@ -308,6 +372,7 @@ class CodexClient:
     def _wait_image(
         self, thread_id: str, turn_id: str, events: list[dict], references: tuple[Path, ...],
         *, on_image: Callable[[GeneratedImage], None] | None = None,
+        expected_hashes: tuple[str, ...] | None = None,
     ) -> GeneratedImage:
         deadline = time.monotonic() + self.timeout
         saved: GeneratedImage | None = None
@@ -330,7 +395,7 @@ class CodexClient:
                     if item.get("status") == "completed":
                         if saved is not None:
                             raise ImageTurnRejected("The turn returned more than one edit for the same tile.")
-                        saved = self._image_from_event(item, references)
+                        saved = self._image_from_event(item, references, expected_hashes)
                         if on_image is not None:
                             on_image(saved)
                     else:
@@ -415,9 +480,14 @@ class CodexClient:
                         + (f" {diagnostic}" if diagnostic else "")
                     )
 
-    def _image_from_event(self, item: dict, references: tuple[Path, ...]) -> GeneratedImage:
+    def _image_from_event(
+        self, item: dict, references: tuple[Path, ...], expected_hashes: tuple[str, ...] | None = None,
+    ) -> GeneratedImage:
         observed = item.get("inputImages")
-        if references and observed:
+        references_verified = None
+        if expected_hashes is not None:
+            references_verified = _verify_reference_hashes(observed, expected_hashes)
+        elif references and observed:
             expected = hashlib.sha256(references[0].read_bytes()).hexdigest()
             if not any(image.get("sha256") == expected for image in observed):
                 raise CodexError("ImageGen returned an edit for a different tile.")
@@ -436,7 +506,7 @@ class CodexClient:
                 pass
         if not 0 < len(data) <= MAX_IMAGE_BYTES:
             raise CodexError("The ImageGen event did not provide an accessible image file.")
-        return GeneratedImage(data, item.get("generationId"))
+        return GeneratedImage(data, item.get("generationId"), references_verified)
 
 
 def _raise_codex_error(error: dict, fallback: str = "", *, error_type: type[CodexError] = CodexError):

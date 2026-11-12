@@ -24,3 +24,6 @@ To use an interface-compatible Windows x64 build of the Qt libraries or bindings
 | NumPy, Pillow, and OpenCV | Dependency license files under `_internal` |
 | PyPNG | `licenses/PyPNG.txt` |
 | Inter font | `_internal/regimagen/assets/Inter-OFL.txt` |
+| EfficientSAM-Ti INT8 model | `licenses/EfficientSAM-Apache-2.0.txt` |
+
+Generative Remove includes the EfficientSAM-Ti INT8 ONNX model distributed by OpenCV under Apache 2.0. The April 2025 export is pinned to revision `1e791988b34b2098736003057da0f3e6bc826259` and verified against SHA-256 `5ecc8d59a2802c32246e68553e1cf8ce74cf74ba707b84f206eb9181ff774b4e`. [OpenCV model source](https://huggingface.co/opencv/image_segmentation_efficientsam/tree/1e791988b34b2098736003057da0f3e6bc826259)

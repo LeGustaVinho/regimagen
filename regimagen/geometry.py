@@ -7,8 +7,9 @@ from itertools import product
 FRAME = 1024
 MARGIN = 64
 CORE = FRAME - 2 * MARGIN
-MIN_COLUMNS, MAX_COLUMNS = 2, 16
-MIN_ROWS, MAX_ROWS = 2, 6
+MIN_COLUMNS = MIN_ROWS = 2
+MAX_PNG_DIMENSION = 2**31 - 1
+DEFAULT_SCALES = (2, 3, 4, 5)
 
 
 @dataclass(frozen=True)
@@ -17,8 +18,8 @@ class Grid:
     rows: int
 
     def __post_init__(self):
-        if not MIN_COLUMNS <= self.columns <= MAX_COLUMNS or not MIN_ROWS <= self.rows <= MAX_ROWS:
-            raise ValueError("The grid must have 2 to 16 columns and 2 to 6 rows.")
+        if self.columns < MIN_COLUMNS or self.rows < MIN_ROWS:
+            raise ValueError("The grid must have at least 2 columns and 2 rows.")
 
     @property
     def count(self) -> int:
@@ -84,12 +85,14 @@ def output_size(width: int, height: int, grid: Grid) -> tuple[int, int]:
 
 
 def scale_limit(width: int, height: int) -> int:
-    return min(CORE * MAX_COLUMNS // width, CORE * MAX_ROWS // height)
+    return MAX_PNG_DIMENSION // max(width, height)
 
 
 def scaled_grid(width: int, height: int, scale: int) -> Grid:
-    if not 2 <= scale <= scale_limit(width, height):
-        raise ValueError(f"The {scale}× scale exceeds the available grid size for this image.")
+    if scale < 2:
+        raise ValueError("Scales must be at least 2×.")
+    if scale > scale_limit(width, height):
+        raise ValueError(f"The {scale}× output exceeds the PNG dimension limit.")
     return Grid(
         max(MIN_COLUMNS, (width * scale + CORE - 1) // CORE),
         max(MIN_ROWS, (height * scale + CORE - 1) // CORE),
@@ -118,17 +121,7 @@ def plan_scales(width: int, height: int, text: str, *, chained: bool) -> list["L
 
 
 def suggested_grid(width: int, height: int) -> Grid:
-    target = output_size(width, height, Grid(MAX_COLUMNS, MAX_ROWS))
-    choices = (
-        Grid(columns, rows)
-        for columns, rows in product(
-            range(MIN_COLUMNS, MAX_COLUMNS + 1), range(MIN_ROWS, MAX_ROWS + 1),
-        )
-    )
-    return min(
-        (grid for grid in choices if output_size(width, height, grid) == target),
-        key=lambda grid: (grid.count, grid.columns),
-    )
+    return scaled_grid(width, height, 2)
 
 
 @dataclass(frozen=True)
@@ -156,6 +149,15 @@ class Layout:
     def enlarges(self) -> bool:
         width, height = self.size
         return width > self.source_width and height > self.source_height
+
+    @property
+    def grid_error(self) -> str | None:
+        width, height = self.size
+        if max(width, height) > MAX_PNG_DIMENSION:
+            return "The output exceeds the PNG dimension limit."
+        if self.grid.columns > width or self.grid.rows > height:
+            return "Reduce the grid along the affected axis so every tile covers at least one output pixel."
+        return None
 
     @property
     def cells(self) -> tuple[Cell, ...]:

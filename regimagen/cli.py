@@ -19,9 +19,10 @@ from regimagen.cli_images import cell_at, cell_json, inspect_image, rectangle, s
 from regimagen.codex import AuthRequired, CodexClient, CodexError, find_codex
 from regimagen.composite import export_parts, export_png, render_part
 from regimagen.files import InvalidStageInput, file_identity, load_source, save_png
-from regimagen.geometry import Grid, Layout, plan_scales, parse_scales, scale_limit, suggested_grid
+from regimagen.geometry import DEFAULT_SCALES, Grid, Layout, plan_scales, parse_scales, scale_limit, suggested_grid
 from regimagen.jobs import (
     RunOutcome, adopt_job_input, load_job_input, pending_cells, refresh_thumbnails, run_scale_batch, run_tiles,
+    transparent_cells,
 )
 from regimagen.seams import seam_region
 from regimagen.storage import Store
@@ -79,6 +80,7 @@ def layout_info(layout: Layout) -> dict:
         "width": width, "height": height, "grid": grid_info(layout.grid), "edits": layout.grid.count,
         "input_width": layout.source_width, "input_height": layout.source_height,
         "scale": layout.scale or None, "input_scale": layout.input_scale, "enlarges": layout.enlarges,
+        "grid_error": layout.grid_error,
     }
 
 
@@ -150,14 +152,7 @@ def executable_for(value: str):
 
 
 def check_destination(store: Store, path: Path, *, overwrite: bool, directory: bool = False):
-    managed = (store.sources.resolve(), store.lots.resolve())
-    if any(path.is_relative_to(folder) for folder in managed) or path in {
-        store.db_path.resolve(), (store.root / "regimagen.lock").resolve(),
-        (store.root / "automation.sqlite3").resolve(),
-        *(store.db_path.with_name(store.db_path.name + suffix).resolve() for suffix in ("-wal", "-shm", "-journal")),
-        *(store.root / f"automation.sqlite3{suffix}" for suffix in ("-wal", "-shm", "-journal")),
-    }:
-        raise ValueError("Choose an output path outside Regimagen's managed files.")
+    store.check_export_destination(path)
     if directory and path.exists() and not path.is_dir():
         raise ValueError("The output directory is a file.")
     if not directory and path.exists() and (not overwrite or path.is_dir()):
@@ -172,15 +167,12 @@ def checked_snapshot(job, store, render):
         return render(store.snapshot(job))
 
 
-def scale_options(width: int, height: int, supplied, config: dict):
+def scale_options(supplied, config: dict):
     if supplied:
         return parse_scales(" ".join(supplied))
     if config["scales"] is not None:
         return tuple(config["scales"])
-    limit = scale_limit(width, height)
-    if limit < 2:
-        raise ValueError("This image is too large for a 2× scale.")
-    return tuple(range(2, min(5, limit) + 1))
+    return DEFAULT_SCALES
 
 
 def plan_for(args, store: Store, config: dict) -> dict:
@@ -195,7 +187,7 @@ def plan_for(args, store: Store, config: dict) -> dict:
         if args.grid:
             raise ValueError("Specify a grid or a scale batch.")
         mode = args.input_mode or config["input_mode"]
-        scales = scale_options(width, height, args.scales, config)
+        scales = scale_options(args.scales, config)
         stages = plan_scales(width, height, " ".join(map(str, scales)), chained=mode == "previous")
         return {"input_mode": mode, "stages": [layout_info(layout) for layout in stages],
                 "max_edits": sum(layout.grid.count for layout in stages)}
@@ -206,6 +198,8 @@ def plan_for(args, store: Store, config: dict) -> dict:
 
 
 def generation_plan(args, job, snapshot) -> tuple[list[list[int]], dict]:
+    if job.layout.grid_error:
+        raise ValueError(job.layout.grid_error)
     if not job.layout.enlarges:
         raise ValueError("The selected grid must enlarge the image in both dimensions. Run plan to see the suggested grid.")
     if args.anchor and not args.preview:
@@ -220,9 +214,12 @@ def generation_plan(args, job, snapshot) -> tuple[list[list[int]], dict]:
         selection = list(job.layout.cells)
     pending = selection if args.regenerate else pending_cells(snapshot, selection)
     positions = [[cell.column + 1, cell.row + 1] for cell in selection]
+    transparent = transparent_cells(job.layout, load_job_input(job)) if args.dry_run and pending else set()
     return positions, {
         "job_id": job.id, "selected": [cell_json(cell) for cell in selection],
-        "pending": [cell_json(cell) for cell in pending], "max_edits": len(pending),
+        "pending": [cell_json(cell) for cell in pending],
+        "transparent": [cell_json(cell) for cell in pending if cell in transparent],
+        "max_edits": sum(cell not in transparent for cell in pending),
         "reused": [cell_json(cell) for cell in selection if cell not in pending],
     }
 
@@ -657,7 +654,7 @@ def dispatch(args, parser, root: Path, operations: Operations) -> dict:
             return job_info(job, writable.snapshot(job))
     if command == "batch":
         source = source_by_id(store, args.source_id)
-        scales = scale_options(source.width, source.height, args.scales, config)
+        scales = scale_options(args.scales, config)
         mode = args.input_mode or config["input_mode"]
         plan_scales(source.width, source.height, " ".join(map(str, scales)), chained=mode == "previous")
         prompt = None
