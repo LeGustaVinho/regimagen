@@ -1,0 +1,28 @@
+[project]
+name = "regimagen"
+version = "0.1.0"
+description = "Generative image reconstruction with Codex ImageGen"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "numpy>=2.3,<3",
+    "opencv-python-headless>=4.13,<5",
+    "Pillow>=12,<14",
+    "pypng>=0.20220715.0",
+    "PySide6-Essentials>=6.12,<6.13",
+]
+
+[project.gui-scripts]
+regimagen = "regimagen.__main__:main"
+
+[project.scripts]
+regimagen-cli = "regimagen.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=9,<10", "pyinstaller>=6.22,<7"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
