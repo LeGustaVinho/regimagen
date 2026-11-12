@@ -10,7 +10,7 @@ from regimagen.codex import find_codex
 from regimagen.composite import export_png
 from regimagen.files import load_source
 from regimagen.geometry import Grid, suggested_grid
-from regimagen.jobs import pending_cells, run_tiles
+from regimagen.jobs import load_job_input, pending_cells, run_tiles
 from regimagen.storage import Store
 from regimagen.workspace import WorkspaceBusy, exclusive_workspace
 
@@ -85,7 +85,7 @@ def validate(args, executable, parser) -> int:
     if pending_cells(snapshot, selection):
         return 4
     if args.output and len(snapshot.current_artifacts) == job.grid.count:
-        source = load_source(job.input_path)
+        source = load_job_input(job)
         export_png(layout, snapshot.current_artifacts, args.output, alpha=source if source.mode == "RGBA" else None)
         print(f"Exported PNG to {args.output}", flush=True)
     warnings = sum(bool(tile.warning) for tile in snapshot.tiles.values())

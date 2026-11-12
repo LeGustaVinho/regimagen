@@ -8,11 +8,11 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from .automation import CommandError
-from .composite import Compositor, STRIPE_HEIGHT
+from .composite import Compositor, MISSING_RGB, STRIPE_HEIGHT
 from .files import atomic_output, load_source, reference_rgb, save_png
 from .geometry import Cell, Rect
 from .imaging import prepare_frame
-from .jobs import prepare_tile_request
+from .jobs import load_job_input, prepare_tile_request
 from .seams import seam_region
 from .storage import Job, Snapshot
 
@@ -50,7 +50,8 @@ def render_reconstruction(job: Job, snapshot: Snapshot, sprite, area: Rect, size
         return Image.fromarray(compositor.render(area)).convert("RGBA").resize(size, Image.Resampling.LANCZOS)
 
     if fit and size[0] < area.width and size[1] < area.height:
-        output = Image.new("RGBA", size)
+        background = (*MISSING_RGB, 255) if sprite is None else (0, 0, 0, 0)
+        output = Image.new("RGBA", size, background)
         for cell, tile in snapshot.tiles.items():
             core = job.layout.core(cell)
             overlap = core.intersect(area)
@@ -132,12 +133,12 @@ def inspect_image(job: Job, snapshot: Snapshot, args, output: Path) -> dict:
         area = Rect(x, y, x + w, y + h)
     size = max(1, min(width, round(area.width * factor))), max(1, min(height, round(area.height * factor)))
     panels = []
+    stage_input = load_job_input(job) if args.view != "original" else None
     if args.view in ("original", "input", "compare"):
-        path = job.source.path if args.view == "original" else job.input_path
-        panels.append(canvas_crop(load_source(path), bounds, area, size))
+        source = load_source(job.source.path) if stage_input is None else stage_input
+        panels.append(canvas_crop(source, bounds, area, size))
     if args.view in ("reconstruction", "compare"):
-        source = load_source(job.input_path)
-        sprite = source if source.mode == "RGBA" else None
+        sprite = stage_input if stage_input.mode == "RGBA" else None
         panels.append(render_reconstruction(job, snapshot, sprite, area, size, fit=fit))
 
     visible = [cell for cell in job.layout.cells if job.layout.core(cell).intersect(area)]
@@ -167,7 +168,7 @@ def inspect_image(job: Job, snapshot: Snapshot, args, output: Path) -> dict:
 
 
 def save_references(job: Job, snapshot: Snapshot, cell: Cell, directory: Path, *, overwrite: bool) -> dict:
-    source = load_source(job.input_path)
+    source = load_job_input(job)
     original = reference_rgb(source)
     frame = prepare_frame(np.asarray(original), job.layout, cell)
     with TemporaryDirectory() as scratch:

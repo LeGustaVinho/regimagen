@@ -3,8 +3,10 @@
 import io
 import os
 import tempfile
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
+from typing import BinaryIO
 
 from PIL import Image, ImageCms, ImageOps, UnidentifiedImageError
 
@@ -16,8 +18,12 @@ FORMATS = ("PNG", "JPEG", "WEBP")
 TRANSPARENT_MATTE = (30, 33, 39)
 
 
+class InvalidStageInput(ValueError):
+    code = "INVALID_STAGE_INPUT"
+
+
 @contextmanager
-def atomic_output(destination: Path, *, overwrite: bool = True):
+def atomic_output(destination: Path, *, overwrite: bool = True, before_publish: Callable[[Path], None] | None = None):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -27,6 +33,8 @@ def atomic_output(destination: Path, *, overwrite: bool = True):
             yield stream
             stream.flush()
             os.fsync(stream.fileno())
+        if before_publish is not None:
+            before_publish(temporary)
         if overwrite:
             os.replace(temporary, destination)
         elif os.name == "nt":
@@ -36,6 +44,15 @@ def atomic_output(destination: Path, *, overwrite: bool = True):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def file_identity(path: Path) -> list[int] | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    # Renaming a file on the same filesystem preserves its file ID and mtime.
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns] if info.st_ino else None
 
 
 def _srgb(image: Image.Image, *, preserve_alpha: bool) -> Image.Image:
@@ -65,9 +82,9 @@ def _srgb(image: Image.Image, *, preserve_alpha: bool) -> Image.Image:
     return result
 
 
-def load_source(path: Path) -> Image.Image:
+def load_source(path: Path | BinaryIO, *, formats: tuple[str, ...] = FORMATS) -> Image.Image:
     try:
-        with Image.open(path, formats=FORMATS) as image:
+        with Image.open(path, formats=formats) as image:
             return _srgb(image, preserve_alpha=True)
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as exc:
         raise ValueError("Could not open the image. Use PNG, JPEG, or WebP.") from exc
@@ -98,6 +115,9 @@ def reference_rgb(image: Image.Image) -> Image.Image:
     return Image.alpha_composite(matte, image).convert("RGB")
 
 
-def save_png(image: Image.Image, destination: Path, *, overwrite: bool = True):
-    with atomic_output(destination, overwrite=overwrite) as stream:
+def save_png(
+    image: Image.Image, destination: Path, *, overwrite: bool = True,
+    before_publish: Callable[[Path], None] | None = None,
+):
+    with atomic_output(destination, overwrite=overwrite, before_publish=before_publish) as stream:
         image.save(stream, format="PNG", icc_profile=SRGB_BYTES)

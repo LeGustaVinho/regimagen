@@ -14,12 +14,14 @@ from threading import Event, Thread
 from uuid import uuid4
 
 from .codex import Cancelled
+from .files import InvalidStageInput, file_identity
 from .workspace import WorkspaceBusy, exclusive_workspace
 
 
 ACTIVE = ("starting", "running")
 RESUMABLE = ("paused", "canceled", "interrupted", "quota_limited", "failed")
 START_TIMEOUT = 30
+DATABASE_TIMEOUT = 10
 DEFAULT_CONFIG = {"codex": "auto", "subagents": False, "scales": None, "input_mode": "original"}
 
 
@@ -38,10 +40,10 @@ class Operations:
         self.path = root / "automation.sqlite3"
 
     @contextmanager
-    def connection(self, *, write: bool = False):
+    def connection(self, *, write: bool = False, timeout: float = DATABASE_TIMEOUT):
         if write:
             self.root.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(self.path if self.path.is_file() or write else ":memory:", timeout=10)
+        db = sqlite3.connect(self.path if self.path.is_file() or write else ":memory:", timeout=timeout)
         db.row_factory = sqlite3.Row
         try:
             with db:
@@ -73,13 +75,17 @@ class Operations:
                 ((key, json.dumps(value)) for key, value in values.items()),
             )
 
-    def rows(self, *, operation_id: str | None = None, request_id: str | None = None) -> list[dict]:
-        with self.connection() as db:
+    def rows(
+        self, *, operation_id: str | None = None, request_id: str | None = None,
+        active_only: bool = False, db_timeout: float = DATABASE_TIMEOUT,
+    ) -> list[dict]:
+        with self.connection(timeout=db_timeout) as db:
             if not db.execute("SELECT 1 FROM sqlite_master WHERE name='operations'").fetchone():
                 return []
             rows = db.execute(
                 "SELECT * FROM operations WHERE (? IS NULL OR id=?) AND (? IS NULL OR request_id=?) "
-                "ORDER BY rowid DESC", (operation_id, operation_id, request_id, request_id),
+                "AND (NOT ? OR state IN ('starting', 'running')) ORDER BY rowid DESC",
+                (operation_id, operation_id, request_id, request_id, active_only),
             ).fetchall()
         return [self.decode(row) for row in rows]
 
@@ -91,43 +97,81 @@ class Operations:
                 item[key] = json.loads(item[key])
         return item
 
-    def get(self, operation_id: str) -> dict:
-        rows = self.rows(operation_id=operation_id)
+    def get(self, operation_id: str, *, db_timeout: float = DATABASE_TIMEOUT) -> dict:
+        rows = self.rows(operation_id=operation_id, db_timeout=db_timeout)
         if not rows:
             raise CommandError("NOT_FOUND", "Operation not found.", status=3)
         return rows[0]
 
-    def change(self, operation_id: str, current_token: str, *, expected_state=None, before_commit=None, **values):
+    def change(
+        self, operation_id: str, current_token: str, *, expected_state=None, before_commit=None,
+        db_timeout: float = DATABASE_TIMEOUT, **values,
+    ):
         values["updated_at"] = time.time()
         for key in ("progress", "error"):
             if key in values and values[key] is not None:
                 values[key] = json.dumps(values[key])
         fields = ", ".join(f"{key}=?" for key in values)
-        with self.connection(write=True) as db:
+        with self.connection(write=True, timeout=db_timeout) as db:
             db.execute(f"UPDATE operations SET {fields} WHERE id=? AND token=? AND (? IS NULL OR state=?)",
                        (*values.values(), operation_id, current_token, expected_state, expected_state))
             if before_commit is not None:
                 before_commit()
 
-    def recover(self, *, locked: bool = False):
-        active = next((item for item in self.rows() if item["state"] in ACTIVE), None)
+    def recover(self, *, locked: bool = False, db_timeout: float = DATABASE_TIMEOUT, before_commit=None):
+        active = next(iter(self.rows(active_only=True, db_timeout=db_timeout)), None)
         if not active or (active["state"] == "starting" and time.time() - active["updated_at"] < START_TIMEOUT):
             return
         if not locked:
             try:
-                with exclusive_workspace(self.root):
-                    self.recover(locked=True)
+                with ExitStack() as workspace:
+                    workspace.enter_context(exclusive_workspace(self.root))
+                    self.recover(locked=True, db_timeout=db_timeout, before_commit=workspace.close)
             except WorkspaceBusy:
                 pass
             return
+        progress = active["progress"]
+        publication = progress.get("export_publication")
+        if active["request"]["kind"] == "export" and publication and publication["identity"]:
+            path = Path(active["request"]["output"])
+            if publication["identity"] == file_identity(path):
+                progress = progress | {"outputs": [publication["artifact"]]}
+                self.change(
+                    active["id"], active["token"], expected_state=active["state"], db_timeout=db_timeout,
+                    before_commit=before_commit, state="completed", action=None, progress=progress, error=None,
+                )
+                return
         self.change(
-            active["id"], active["token"], expected_state=active["state"], state="interrupted", action=None,
+            active["id"], active["token"], expected_state=active["state"], db_timeout=db_timeout,
+            before_commit=before_commit, state="interrupted", action=None,
             error={"code": "WORKER_INTERRUPTED", "message": "The worker exited before reporting a result."},
         )
 
+    def wait(self, operation_id: str, timeout: float) -> tuple[dict, bool]:
+        deadline = time.monotonic() + timeout
+        latest = None
+        while True:
+            try:
+                latest = self.get(operation_id, db_timeout=0)
+                if latest["state"] in ACTIVE and time.monotonic() < deadline:
+                    self.recover(db_timeout=0)
+                    latest = self.get(operation_id, db_timeout=0)
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", 0) & 0xff
+                if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+            if latest is not None and latest["state"] not in ACTIVE:
+                return latest, False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if latest is None:
+                    raise CommandError("OPERATION_STATE_BUSY", "The operation database is busy. Retry the wait.", status=4)
+                return latest, True
+            time.sleep(min(0.2, remaining))
+
     def require_idle(self):
         self.recover(locked=True)
-        if any(item["state"] in ACTIVE for item in self.rows()):
+        if self.rows(active_only=True):
             raise WorkspaceBusy("A Regimagen operation is starting in this workspace.")
 
     def replay(self, request: dict, key: str | None) -> dict | None:
@@ -184,12 +228,18 @@ class Operations:
             with exclusive_workspace(self.root):
                 self.require_idle()
                 item = self.get(operation_id)
-                if item["state"] not in RESUMABLE or item["request"]["kind"] not in ("generate", "batch"):
+                kind = item["request"]["kind"]
+                if kind == "export" and item["state"] == "completed":
+                    return item
+                can_resume = kind in ("generate", "batch") and item["state"] in RESUMABLE
+                if not can_resume and not (kind == "export" and item["state"] == "interrupted"):
                     raise CommandError("INVALID_STATE", "This operation cannot be resumed.", status=4)
                 token = uuid4().hex
                 progress = item["progress"]
-                if item["request"]["kind"] == "batch":
+                if kind == "batch":
                     progress = progress | {"outputs": [], "completed_stages": 0}
+                elif kind == "export":
+                    progress = {}
                 self.change(operation_id, item["token"], state="starting", token=token, action=None, error=None,
                             quota_reset=None, pid=None, progress=progress)
                 self.launch(operation_id, token)
@@ -256,6 +306,8 @@ class Operations:
             quota_reset = outcome.quota_reset
         except Cancelled:
             state, error, quota_reset = "canceled", None, None
+        except InvalidStageInput as exc:
+            state, error, quota_reset = "failed", {"code": exc.code, "message": str(exc)}, None
         except Exception as exc:
             code = "OUTPUT_EXISTS" if isinstance(exc, FileExistsError) else "OPERATION_FAILED"
             error = exc.as_dict() if isinstance(exc, CommandError) else {"code": code, "message": str(exc)}

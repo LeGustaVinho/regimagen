@@ -41,14 +41,17 @@ class FakeImageGen:
     def __exit__(self, *_):
         return None
 
-    def generate(self, prompt, references):
+    def generate(self, prompt, references, *, on_image=None):
         with Image.open(references[0]) as primary:
             assert primary.size == (FRAME, FRAME)
         self.calls.append((prompt, len(references)))
         reply = next(self.replies)
         if isinstance(reply, Exception):
             raise reply
-        return GeneratedImage(reply, f"image-{len(self.calls)}")
+        result = GeneratedImage(reply, f"image-{len(self.calls)}")
+        if on_image is not None:
+            on_image(result)
+        return result
 
 
 def make_job(directory, grid, source_size=(320, 320)):
@@ -122,6 +125,52 @@ def test_recover_artifact_already_received_without_new_generation(tmp_path):
     assert provider.calls == []
     assert set(store.snapshot(job).artifacts) == {cell}
     assert not (job.folder / "attempt.image").exists()
+
+
+@pytest.mark.parametrize("turn_status", ["local_cancel", "interrupted", "failed"])
+def test_single_tile_checkpoints_image_event_before_turn_completion(tmp_path, turn_status):
+    store, job = make_job(tmp_path, Grid(2, 2))
+    cell = job.layout.cells[0]
+    cancelled = Event()
+    data = png_bytes()
+    interrupted = turn_status != "failed"
+
+    class DeliveredImage(CodexClient):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def _run_turn(self, _inputs, wait, **_options):
+            image = {"method": "item/completed", "params": {
+                "threadId": "thread", "turnId": "turn", "item": {"type": "imageGeneration", "status": "completed"},
+            }}
+            return wait("thread", "turn", [image])
+
+        def _image_from_event(self, *_):
+            return GeneratedImage(data, "delivered-image")
+
+        def _receive(self, _deadline):
+            if turn_status == "local_cancel":
+                cancelled.set()
+                raise Cancelled("Generation canceled.")
+            return {"method": "turn/completed", "params": {
+                "threadId": "thread", "turn": {"id": "turn", "status": turn_status, "error": {"message": "Rejected."}},
+            }}
+
+    outcome = run_tiles(store, job, [cell], Path("codex.exe"), pause=Event(), cancelled=cancelled,
+                        client_factory=DeliveredImage)
+    pending = store.snapshot(job).tiles[cell]
+    assert pending.artifact is None
+    assert (job.folder / f"{pending.attempt}.image").is_file() == interrupted
+    assert outcome.state == ("canceled" if interrupted else "failed")
+    resume = FakeImageGen([] if interrupted else [data])
+    run(store, job, [cell], resume)
+    tile = store.snapshot(job).tiles[cell]
+    assert tile.artifact is not None
+    assert tile.generation_id == ("delivered-image" if interrupted else "image-1")
+    assert len(resume.calls) == (0 if interrupted else 1)
 
 
 def test_prompt_changes_regenerate_only_affected_tiles(tmp_path):

@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from hashlib import file_digest, sha256
+import json
 from itertools import batched
 from pathlib import Path
 from shutil import copyfileobj
@@ -14,9 +15,11 @@ from uuid import uuid4
 import numpy as np
 from PIL import Image
 
-from .codex import AGENT_GROUP_SIZE, AuthRequired, Cancelled, CodexClient, CodexError, GeneratedImage, QuotaPaused
+from .codex import (
+    AGENT_GROUP_SIZE, AuthRequired, Cancelled, CodexClient, CodexError, GeneratedImage, ImageTurnRejected, QuotaPaused,
+)
 from .composite import Compositor, export_png
-from .files import atomic_output, load_generated, load_source, reference_rgb, save_png
+from .files import InvalidStageInput, atomic_output, load_generated, load_source, reference_rgb, save_png
 from .geometry import Cell, Layout
 from .imaging import (
     EDIT_PROMPT, REPAIR_PROMPT, align_tile, prepare_frame, read_tile, seam_warning, write_references,
@@ -31,6 +34,7 @@ SPRITE_PROMPT = (
     "clean, antialiased contours. Avoid outlines, shadows or glow on the matte. "
     "Reconstruct the existing surface details in place."
 )
+STAGED_IMAGE_HEADER = b"Regimagen staged image v1\n"
 
 
 def pending_cells(snapshot: Snapshot, selection: Iterable[Cell]) -> list[Cell]:
@@ -47,6 +51,69 @@ class RunOutcome:
     code: str | None = None
     message: str | None = None
     quota_reset: int | None = None
+
+
+def _read_staged_image(path: Path) -> GeneratedImage:
+    with path.open("rb") as stream:
+        generation_id = None
+        if stream.read(len(STAGED_IMAGE_HEADER)) == STAGED_IMAGE_HEADER:
+            generation_id = json.loads(stream.readline())
+            if generation_id is not None and not isinstance(generation_id, str):
+                raise ValueError("The staged image has an invalid generation ID.")
+        else:
+            stream.seek(0)  # Earlier versions staged the original image bytes.
+        return GeneratedImage(stream.read(), generation_id)
+
+
+def _stage_checksum(cache: Path) -> str | None:
+    try:
+        return cache.with_suffix(".sha256").read_text(encoding="ascii").strip() or None
+    except (OSError, UnicodeError):
+        return None
+
+
+def load_job_input(job: Job) -> Image.Image:
+    path = job.input_path
+    if not job.input_revision:
+        return load_source(path)
+    expected_hash = _stage_checksum(path)
+    if not expected_hash and path.is_file() and not path.with_suffix(".sha256").exists():
+        raise InvalidStageInput(
+            "The saved scale image has no checksum. Run the batch again, or verify the historical PNG "
+            "and use job adopt-input to keep this exact revision."
+        )
+    image, _ = _verified_stage(job, path, expected_hash or "")
+    return image
+
+
+def _verified_stage(job: Job, path: Path, expected_hash: str | None) -> tuple[Image.Image, str]:
+    message = "The previous scale image is missing or failed verification. Run the scale batch again to rebuild it."
+    layout = job.layout
+    try:
+        with path.open("rb") as stream:
+            digest = file_digest(stream, "sha256").hexdigest()
+            if expected_hash is None or digest == expected_hash:
+                stream.seek(0)
+                image = load_source(stream, formats=("PNG",))
+                if image.size == (layout.source_width, layout.source_height):
+                    return image, digest
+    except (OSError, ValueError) as exc:
+        raise InvalidStageInput(message) from exc
+    raise InvalidStageInput(message)
+
+
+def adopt_job_input(job: Job) -> str:
+    if not job.input_revision:
+        raise ValueError("Select a job that uses a previous scale image.")
+    path = job.input_path
+    checksum = path.with_suffix(".sha256")
+    if checksum.exists():
+        _, digest = _verified_stage(job, path, _stage_checksum(path) or "")
+        return digest
+    _, digest = _verified_stage(job, path, None)
+    with atomic_output(checksum, overwrite=False) as stream:
+        stream.write(digest.encode("ascii") + b"\n")
+    return digest
 
 
 def prepare_tile_request(
@@ -88,7 +155,7 @@ def run_tiles(
     if not layout.enlarges:
         raise ValueError("The selected grid must enlarge the image in both dimensions.")
     job.folder.mkdir(exist_ok=True)
-    imported = input_image if input_image is not None else load_source(job.input_path)
+    imported = input_image if input_image is not None else load_job_input(job)
     alpha = imported if imported.mode == "RGBA" else None
     original = reference_rgb(imported)
     source = np.asarray(original)
@@ -118,7 +185,9 @@ def run_tiles(
                         attempts[current] = (attempt, staged, frame)
                         if staged.is_file():
                             try:
-                                generated[current] = load_generated(staged.read_bytes())
+                                recovered = _read_staged_image(staged)
+                                generated[current] = load_generated(recovered.data)
+                                generation_ids[current] = recovered.generation_id
                                 continue
                             except ValueError:
                                 staged.unlink()
@@ -130,12 +199,18 @@ def run_tiles(
                         )
                         queued.append((current, prompt, inputs))
 
-                    def stage(index: int, result: GeneratedImage):
+                    def save_received(index: int, result: GeneratedImage) -> Image.Image:
                         cell = queued[index][0]
                         image = load_generated(result.data)
                         with atomic_output(attempts[cell][1]) as stream:
+                            stream.write(STAGED_IMAGE_HEADER)
+                            stream.write(json.dumps(result.generation_id).encode("ascii") + b"\n")
                             stream.write(result.data)
-                        generated[cell] = image
+                        return image
+
+                    def stage(index: int, result: GeneratedImage):
+                        cell = queued[index][0]
+                        generated[cell] = save_received(index, result)
                         generation_ids[cell] = result.generation_id
 
                     failure = None
@@ -148,8 +223,21 @@ def run_tiles(
                             if subagents:
                                 client.generate_delegated([(prompt, refs) for _, prompt, refs in queued], stage)
                             else:
-                                _, prompt, refs = queued[0]
-                                stage(0, client.generate(prompt, refs))
+                                cell, prompt, refs = queued[0]
+                                provisional = None
+
+                                def checkpoint(result: GeneratedImage):
+                                    nonlocal provisional
+                                    provisional = save_received(0, result)
+
+                                try:
+                                    result = client.generate(prompt, refs, on_image=checkpoint)
+                                except ImageTurnRejected:
+                                    if provisional is not None:
+                                        attempts[cell][1].unlink(missing_ok=True)
+                                    raise
+                                generated[cell] = provisional if provisional is not None else save_received(0, result)
+                                generation_ids[cell] = result.generation_id
                         except (CodexError, OSError, ValueError) as exc:
                             failure = exc
 
@@ -188,10 +276,7 @@ def _file_sha256(path: Path) -> str | None:
 
 def _scale_cache_digest(layout, artifacts, cache, alpha, cancelled) -> str:
     checksum = cache.with_suffix(".sha256")
-    try:
-        recorded_hash = checksum.read_text(encoding="ascii").strip()
-    except (FileNotFoundError, UnicodeError):
-        recorded_hash = None
+    recorded_hash = _stage_checksum(cache)
     digest = recorded_hash
     if not digest or _file_sha256(cache) != digest:
         export_png(layout, artifacts, cache, alpha=alpha, cancelled=cancelled.is_set)
@@ -243,7 +328,7 @@ def run_scale_batch(
         if prompt is not None:
             store.set_prompt(job, prompt)
         if job.input_path != input_path:
-            imported = load_source(job.input_path)
+            imported = load_job_input(job)
             input_path = job.input_path
         on_stage(job, imported)
         cells = pending_cells(store.snapshot(job), job.layout.cells)

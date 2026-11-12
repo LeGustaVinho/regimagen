@@ -21,7 +21,7 @@ from .geometry import (
     MAX_COLUMNS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS, Cell, Grid, Layout,
     plan_scales, scale_limit, suggested_grid,
 )
-from .jobs import pending_cells, refresh_thumbnails, run_scale_batch, run_tiles
+from .jobs import load_job_input, pending_cells, refresh_thumbnails, run_scale_batch, run_tiles
 from .storage import Job, Snapshot, Source, Store, Tile
 from .viewer import Comparison, qimage
 
@@ -392,7 +392,7 @@ class Window(QMainWindow):
         if item is None or self.task is not None:
             return
         def load(_update, _pause, cancel):
-            image = load_source(item.input_path)
+            image = load_job_input(item)
             sprite = image if image.mode == "RGBA" else None
             refresh_thumbnails(self.store, item, alpha=sprite, cancelled=cancel.is_set)
             return item.source, qimage(np.asarray(image)), item.grid, sprite, item

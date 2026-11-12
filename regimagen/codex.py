@@ -36,6 +36,10 @@ class AuthRequired(CodexError):
     pass
 
 
+class ImageTurnRejected(CodexError):
+    pass
+
+
 class QuotaPaused(CodexError):
     def __init__(self, resets_at: int | None = None):
         super().__init__("Codex has reached its usage limit.")
@@ -227,11 +231,14 @@ class CodexClient:
             if events is not None and "method" in message:
                 events.append(message)
 
-    def generate(self, prompt: str, references: tuple[Path, ...] = ()) -> GeneratedImage:
+    def generate(
+        self, prompt: str, references: tuple[Path, ...] = (), *,
+        on_image: Callable[[GeneratedImage], None] | None = None,
+    ) -> GeneratedImage:
         attachments = [{"type": "localImage", "path": str(path.resolve())} for path in references]
         return self._run_turn(
             [{"type": "text", "text": prompt}, *attachments],
-            lambda thread, turn, events: self._wait_image(thread, turn, events, references),
+            lambda thread, turn, events: self._wait_image(thread, turn, events, references, on_image=on_image),
         )
 
     def generate_delegated(
@@ -300,6 +307,7 @@ class CodexClient:
 
     def _wait_image(
         self, thread_id: str, turn_id: str, events: list[dict], references: tuple[Path, ...],
+        *, on_image: Callable[[GeneratedImage], None] | None = None,
     ) -> GeneratedImage:
         deadline = time.monotonic() + self.timeout
         saved: GeneratedImage | None = None
@@ -321,19 +329,24 @@ class CodexClient:
                         raise QuotaPaused(failure.get("resetsAt"))
                     if item.get("status") == "completed":
                         if saved is not None:
-                            raise CodexError("The turn returned more than one edit for the same tile.")
+                            raise ImageTurnRejected("The turn returned more than one edit for the same tile.")
                         saved = self._image_from_event(item, references)
+                        if on_image is not None:
+                            on_image(saved)
                     else:
                         diagnostic = f"ImageGen: {item.get('status', 'failed')}"
                 elif item.get("type") == "agentMessage":
                     diagnostic = item.get("text", "")[:600]
             if method == "error" and params.get("turnId") == turn_id:
                 if not params.get("willRetry"):
-                    _raise_codex_error(params.get("error") or {})
+                    _raise_codex_error(params.get("error") or {}, error_type=ImageTurnRejected)
             if method == "turn/completed" and params.get("turn", {}).get("id") == turn_id:
                 turn = params["turn"]
-                if turn.get("status") != "completed":
-                    _raise_codex_error(turn.get("error") or {}, diagnostic)
+                status = turn.get("status")
+                if status == "interrupted":
+                    raise Cancelled("Generation canceled.")
+                if status != "completed":
+                    _raise_codex_error(turn.get("error") or {}, diagnostic, error_type=ImageTurnRejected)
                 if saved is None:
                     raise CodexError(
                         "The turn ended without an ImageGen edit."
@@ -426,11 +439,11 @@ class CodexClient:
         return GeneratedImage(data, item.get("generationId"))
 
 
-def _raise_codex_error(error: dict, fallback: str = ""):
+def _raise_codex_error(error: dict, fallback: str = "", *, error_type: type[CodexError] = CodexError):
     detail = error.get("codexErrorInfo") or error.get("data")
     message = error.get("message") or fallback or "The Codex CLI did not complete the edit."
     if detail == "usageLimitExceeded" or (
         isinstance(detail, dict) and "usageLimitExceeded" in detail
     ):
         raise QuotaPaused()
-    raise CodexError(str(message)[:800])
+    raise error_type(str(message)[:800])

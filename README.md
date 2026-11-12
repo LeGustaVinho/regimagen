@@ -62,12 +62,14 @@ $batch = ((& $cli batch start $source --scales 2 4 --input-mode previous --outpu
 
 Scales are relative to the original size. `--input-mode original` uses the original for every scale. `--input-mode previous` requires ascending scales and uses each completed stage's PNG for the next stage. A batch can inherit a global prompt from a job for the same source or read one from `--prompt-file`. With no prompt override, each saved stage keeps its global and per-tile prompts. `operation status` reports each verified PNG, its job ID, and the input used for that stage. On resume, Regimagen checks saved exports in stage order and rebuilds missing or changed PNGs from the committed tiles. It also verifies shared scale caches by checksum before reusing them in another batch. An outdated downstream PNG can remain on disk until its stage is reached.
 
+When opening a saved chained stage, Regimagen verifies its input against the cached checksum. A scale batch can rebuild missing or changed caches for its current stages. To recover a historical stage that predates checksums, check the PNG at the `input_path` from `job show`, then run `job adopt-input JOB_ID` to record its checksum and reopen that exact revision. The command validates the PNG and its dimensions. An existing checksum remains authoritative.
+
 ### Desktop workflow coverage
 
 | Desktop capability | CLI |
 | --- | --- |
 | Open or drop PNG, JPEG, and WebP, including alpha | `source import FILE` |
-| Browse original images and saved projects | `source list/show`, `job list [--source ID]`, `job show ID` |
+| Browse original images and saved projects | `source list/show`, `job list [--source ID]`, `job show ID`, `job adopt-input ID` for a verified historical PNG |
 | Suggested grid, independent column and row counts, output size, and edit count | `plan ID` or `plan --file FILE`, `--grid COLUMNS ROWS`, `job create` |
 | Global and selected-tile art direction | `prompt get/set/clear` with optional `--tile COLUMN ROW`. Set from `--text`, a UTF-8 `--file`, or `--stdin`. |
 | Centered or selected 2×2 preview, full generation, and selected-tile repair | `generate --preview [--anchor COLUMN ROW]`, `generate`, `generate --tile COLUMN ROW [--tile ...] --regenerate`. Add `--dry-run` to count pending and reusable results. |
@@ -85,9 +87,11 @@ Tile columns and rows start at 1. Image coordinates start at 0 in the output can
 
 The CLI defaults to `%LOCALAPPDATA%\Regimagen\cli`. Put `--data-dir DIR` before the command to select a workspace. To share saved sources, prompts, and jobs with the desktop, point it at the desktop's `%LOCALAPPDATA%\Regimagen` folder. Close the desktop before starting work in the shared folder. Read commands can inspect saved state while the desktop or worker has the workspace open. CLI preferences are saved per workspace and can be overridden on each run.
 
-Generation, scale batches, thumbnail refreshes, and exports return an `operation_id` and run in a detached local process. Use `operation wait ID --timeout SECONDS` for a bounded wait. `timed_out: true` means the operation is still active. `operation pause` lets the active tile or delegated group finish. `operation cancel` requests cancellation and keeps committed tiles and published files. Resume a paused, canceled, failed, quota-limited, or interrupted generation or scale batch using `operation resume ID`. If Codex reports a quota reset, `quota_reset` is a Unix timestamp. A new generation operation can also continue a saved job by selecting its pending tiles.
+Generation, scale batches, thumbnail refreshes, and exports return an `operation_id` and run in a detached local process. Use `operation wait ID --timeout SECONDS` for a bounded wait, or `--timeout 0` for an immediate status snapshot. `timed_out: true` means the latest observed state was active when the wait expired. `OPERATION_STATE_BUSY` means the database was locked throughout the wait and no snapshot was available. `operation pause` lets the active tile or delegated group finish. `operation cancel` requests cancellation and keeps committed tiles and published files. Resume a paused, canceled, failed, quota-limited, or interrupted generation or scale batch using `operation resume ID`. If Codex reports a quota reset, `quota_reset` is a Unix timestamp. A new generation operation can also continue a saved job by selecting its pending tiles.
 
 Use `--request-id` on a background command to retrieve the existing operation after a client retry. Reusing a key with different parameters returns `REQUEST_ID_CONFLICT`. The worker writes state to the selected workspace, and stopping the terminal or a wait command leaves it running. Workspace mutations and background work are serialized. Run operations in different workspaces if you need independent project state.
+
+If a worker exits during an export, use `operation resume ID` to recover the same operation. Regimagen reports completion if it recognizes the published file. Otherwise it retries with the original destination and overwrite preference. Single-tile generation checkpoints a delivered ImageGen result while the turn is active, so a cancellation after delivery can reuse the image and its generation ID.
 
 ## Run from source
 

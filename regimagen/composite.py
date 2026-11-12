@@ -25,6 +25,7 @@ LINEAR_RGB = np.where(_levels <= 0.04045, _levels / 12.92, ((_levels + 0.055) / 
 BANDS = (COLOR_FEATHER, 5.0, 1.25)
 BLUR_RADIUS = 24
 STRIPE_HEIGHT = 64
+MISSING_RGB = (20, 22, 28)
 
 
 @dataclass(frozen=True)
@@ -126,7 +127,7 @@ class Compositor:
             raise ValueError("The compositing area must be inside the image.")
         if self.matte is None:
             pixels, missing = self._render_rgb(area)
-            pixels[missing] = (20, 22, 28)
+            pixels[missing] = MISSING_RGB
             return pixels
 
         # Matte correction uses the same neighborhood for zoom and export.
@@ -240,12 +241,13 @@ def export_parts(
     cancelled: Callable[[], bool] = lambda: False,
     alpha: Image.Image | None = None,
     overwrite: bool = True,
+    before_publish: Callable[[Path], None] | None = None,
 ):
     if not artifacts:
         raise ValueError("Generate at least one tile before exporting.")
     width, height = layout.size
     manifest = {"width": width, "height": height, "tiles": []}
-    with atomic_output(destination, overwrite=overwrite) as stream, ZipFile(stream, "w") as archive:
+    with atomic_output(destination, overwrite=overwrite, before_publish=before_publish) as stream, ZipFile(stream, "w") as archive:
         for index, (cell, artifact) in enumerate(artifacts.items(), start=1):
             if cancelled():
                 raise Cancelled("Export canceled.")
@@ -270,6 +272,7 @@ def export_png(
     cancelled: Callable[[], bool] = lambda: False,
     alpha: Image.Image | None = None,
     overwrite: bool = True,
+    before_publish: Callable[[Path], None] | None = None,
 ):
     if set(artifacts) != set(layout.cells):
         raise ValueError("Complete all tiles in the grid before exporting.")
@@ -285,7 +288,7 @@ def export_png(
             yield from (row.tobytes() for row in band)
             progress(bottom, height)
 
-    with atomic_output(destination, overwrite=overwrite) as stream:
+    with atomic_output(destination, overwrite=overwrite, before_publish=before_publish) as stream:
         _SrgbWriter(width, height, greyscale=False, alpha=alpha is not None, compression=3).write(stream, rows())
         if cancelled():
             raise Cancelled("Export canceled.")

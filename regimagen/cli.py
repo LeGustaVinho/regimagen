@@ -10,18 +10,19 @@ from pathlib import Path
 import sqlite3
 import sys
 from tempfile import TemporaryDirectory
-import time
 
 from PySide6.QtCore import QCoreApplication
 
 from regimagen import __version__
-from regimagen.automation import ACTIVE, DEFAULT_CONFIG, CommandError, Operations
+from regimagen.automation import DEFAULT_CONFIG, CommandError, Operations
 from regimagen.cli_images import cell_at, cell_json, inspect_image, rectangle, save_references
 from regimagen.codex import AuthRequired, CodexClient, CodexError, find_codex
 from regimagen.composite import export_parts, export_png, render_part
-from regimagen.files import load_source, save_png
+from regimagen.files import InvalidStageInput, file_identity, load_source, save_png
 from regimagen.geometry import Grid, Layout, plan_scales, parse_scales, scale_limit, suggested_grid
-from regimagen.jobs import RunOutcome, pending_cells, refresh_thumbnails, run_scale_batch, run_tiles
+from regimagen.jobs import (
+    RunOutcome, adopt_job_input, load_job_input, pending_cells, refresh_thumbnails, run_scale_batch, run_tiles,
+)
 from regimagen.seams import seam_region
 from regimagen.storage import Store
 from regimagen.workspace import WorkspaceBusy, exclusive_workspace
@@ -47,7 +48,8 @@ def default_root() -> Path:
 def operation_json(item: dict) -> dict:
     request = item["request"]
     progress = {
-        key: value for key, value in item["progress"].items() if key not in ("baseline", "revisions", "publications")
+        key: value for key, value in item["progress"].items()
+        if key not in ("baseline", "revisions", "publications", "export_publication")
     }
     return {
         "operation_id": item["id"], "request_id": item["request_id"], "kind": request["kind"],
@@ -282,7 +284,7 @@ def run_operation(root: Path, item, pause, cancel, report) -> RunOutcome:
             on_change=change, subagents=request["subagents"],
         )
 
-    source = load_source(job.input_path)
+    source = load_job_input(job)
     sprite = source if source.mode == "RGBA" else None
     if kind == "refresh_previews":
         refresh_thumbnails(store, job, force=True, alpha=sprite, cancelled=cancel.is_set)
@@ -301,20 +303,28 @@ def run_operation(root: Path, item, pause, cancel, report) -> RunOutcome:
         report(job_id=job.id, completed=done, total=total, unit="rows" if format_name == "png" else "tiles")
 
     artifact = {"path": str(output), "format": format_name}
+
+    def checkpoint(staged: Path):
+        if cancel.is_set():
+            raise Cancelled("Export canceled.")
+        if format_name == "tile-png":
+            progress(1, 1)
+        report(export_publication={"identity": file_identity(staged), "artifact": artifact})
+
     if format_name == "tile-png":
         cell, path = next(iter(artifacts.items()))
         image, position = render_part(job.layout, cell, path, alpha=sprite)
         if cancel.is_set():
             return RunOutcome("canceled")
-        save_png(image, output, overwrite=overwrite)
         artifact.update(position, **cell_json(cell))
-        progress(1, 1)
+        save_png(image, output, overwrite=overwrite, before_publish=checkpoint)
     else:
         exporter = export_png if format_name == "png" else export_parts
-        exporter(job.layout, artifacts, output, progress=progress, cancelled=cancel.is_set, alpha=sprite, overwrite=overwrite)
         artifact.update(width=job.layout.size[0], height=job.layout.size[1])
         if format_name == "tiles-zip":
             artifact["manifest"] = "positions.json"
+        exporter(job.layout, artifacts, output, progress=progress, cancelled=cancel.is_set, alpha=sprite,
+                 overwrite=overwrite, before_publish=checkpoint)
     report(outputs=[artifact])
     return RunOutcome()
 
@@ -435,6 +445,7 @@ def command_parser():
     create.add_argument("--grid", nargs=2, type=int, metavar=("COLUMNS", "ROWS"))
     leaf(jobs, "list", "List saved jobs.").add_argument("--source", dest="source_id")
     job_id(leaf(jobs, "show", "Show geometry, progress, tiles, and seam warnings."))
+    job_id(leaf(jobs, "adopt-input", "Record the checksum for the verified historical input of this job."))
     background(job_id(leaf(jobs, "refresh-previews", "Rebuild thumbnails from committed tiles.")))
 
     prompts = group("prompt", "Read and edit global or per-tile art direction.")
@@ -561,25 +572,18 @@ def read_prompt(args) -> str:
 
 
 def manage_operations(args, operations: Operations) -> dict:
-    operations.recover()
+    if args.action == "wait":
+        if not math.isfinite(args.timeout) or args.timeout < 0:
+            raise ValueError("The wait timeout must be a finite, nonnegative number.")
+        item, timed_out = operations.wait(args.operation_id, args.timeout)
+        return operation_json(item) | {"timed_out": timed_out}
     if args.action == "list":
+        operations.recover()
         return {"operations": [operation_json(item) for item in operations.rows()]}
     if args.action in ("pause", "cancel", "resume"):
         return operation_json(operations.control(args.operation_id, args.action))
-    item = operations.get(args.operation_id)
-    if args.action == "status":
-        return operation_json(item)
-    if not math.isfinite(args.timeout) or args.timeout < 0:
-        raise ValueError("The wait timeout must be a finite, nonnegative number.")
-    deadline = time.monotonic() + args.timeout
-    while item["state"] in ACTIVE:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(0.2, remaining))
-        operations.recover()
-        item = operations.get(args.operation_id)
-    return operation_json(item) | {"timed_out": item["state"] in ACTIVE}
+    operations.recover()
+    return operation_json(operations.get(args.operation_id))
 
 
 def preferences(args, operations: Operations) -> dict:
@@ -678,6 +682,12 @@ def dispatch(args, parser, root: Path, operations: Operations) -> dict:
     if command == "job":
         if args.action == "show":
             return job_info(job, snapshot, tiles=True)
+        if args.action == "adopt-input":
+            with exclusive_workspace(root):
+                operations.require_idle()
+                digest = adopt_job_input(job)
+            return {"job_id": job.id, "input_revision": job.input_revision, "input_path": str(job.input_path),
+                    "sha256": digest}
         request = {"kind": "refresh_previews", "job_id": job.id}
         return operation_json(operations.submit(request, args.request_id))
     if command == "prompt":
@@ -754,6 +764,8 @@ def main(argv=None) -> int:
         error = CommandError("CODEX_UNAVAILABLE", str(exc), status=1)
     except FileExistsError as exc:
         error = CommandError("OUTPUT_EXISTS", str(exc), status=4)
+    except InvalidStageInput as exc:
+        error = CommandError(exc.code, str(exc), status=4)
     except ValueError as exc:
         error = CommandError("INVALID_ARGUMENT", str(exc))
     except (OSError, sqlite3.Error) as exc:

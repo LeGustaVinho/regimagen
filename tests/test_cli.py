@@ -3,7 +3,9 @@ import json
 import os
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
+from hashlib import sha256
 from pathlib import Path
 from threading import Event, Thread
 from zipfile import ZipFile
@@ -16,7 +18,7 @@ from regimagen import automation, cli, jobs
 from regimagen.automation import Operations
 from regimagen.cli_images import render_reconstruction
 from regimagen.codex import AuthRequired, GeneratedImage, QuotaPaused
-from regimagen.composite import Compositor, STRIPE_HEIGHT
+from regimagen.composite import Compositor, MISSING_RGB, STRIPE_HEIGHT
 from regimagen.geometry import FRAME, Grid, Rect
 from regimagen.imaging import prepare_frame
 from regimagen.storage import Store
@@ -264,6 +266,24 @@ def test_wait_reports_completion_after_workspace_release(controlled_worker, spri
     assert invoke("generate", job["job_id"], "--preview")["operation_id"] != operation
 
 
+def test_wait_honors_deadline_during_sqlite_contention(controlled_worker, sprite):
+    ops, invoke, _ = controlled_worker
+    _, job = import_job(invoke, sprite)
+    oid = invoke("generate", job["job_id"], "--preview")["operation_id"]
+    item = ops.get(oid)
+    ops.change(oid, item["token"], state="running")
+    with ops.connection(write=True):
+        start = time.monotonic()
+        for timeout in (0, 0.05):
+            result = invoke("operation", "wait", oid, "--timeout", timeout)
+            assert result["state"] == "running" and result["timed_out"]
+        assert time.monotonic() - start < 1
+    with ops.connection() as db:
+        db.execute("BEGIN EXCLUSIVE")
+        invoke("operation", "wait", oid, "--timeout", 0, error="OPERATION_STATE_BUSY")
+    assert invoke("operation", "wait", oid, "--timeout", 1)["state"] == "interrupted"
+
+
 def test_recovery_preserves_concurrent_completion(controlled_worker, sprite, monkeypatch):
     ops, invoke, run_next = controlled_worker
     _, job = import_job(invoke, sprite)
@@ -317,6 +337,29 @@ def test_large_inspection_resamples_across_stripes(command):
     expected = reference.resize(size, Image.Resampling.LANCZOS)
     rendered = render_reconstruction(job, snapshot, None, area, size, fit=False)
     assert rendered.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("transparent", [False, True])
+def test_partial_inspection_keeps_background_at_equal_zoom(command, tmp_path, transparent):
+    root, invoke = command
+    store = Store(root)
+    source_image = Image.new("RGBA" if transparent else "RGB", (320, 320))
+    if transparent:
+        ImageDraw.Draw(source_image).rectangle((10, 10, 120, 120), fill=(112, 131, 147, 210))
+    source = store.import_source(source_image, "source.png")
+    job = store.ensure_job(source, Grid(2, 2))
+    seed_tile(store, job, job.layout.cells[0])
+    jobs.refresh_thumbnails(store, job, alpha=source_image if transparent else None)
+    output = tmp_path / "partial.png"
+    expected = (0, 0, 0, 0) if transparent else (*MISSING_RGB, 255)
+    args = ("inspect", job.id, "--view", "reconstruction", "--viewport", 1024, 1024, "--output", output)
+    fit = invoke(*args)
+    with Image.open(output) as image:
+        assert image.getpixel((900, 900)) == expected
+    explicit = invoke(*args, "--overwrite", "--zoom", fit["zoom"])
+    assert explicit["region"] == fit["region"] and explicit["panel_size"] == fit["panel_size"]
+    with Image.open(output) as image:
+        assert image.getpixel((900, 900)) == expected
 
 
 def test_refresh_previews_recovers_from_failed_tile_commit(controlled_worker, monkeypatch, tmp_path):
@@ -383,11 +426,14 @@ class ImageProvider:
     def __exit__(self, *_):
         return None
 
-    def generate(self, prompt, references):
+    def generate(self, prompt, references, *, on_image=None):
         if self.limit is not None and len(self.calls) == self.limit:
             raise QuotaPaused(1_798_000_000)
         self.calls.append((prompt, len(references)))
-        return GeneratedImage(self.image, f"simulated-{len(self.calls)}")
+        result = GeneratedImage(self.image, f"simulated-{len(self.calls)}")
+        if on_image is not None:
+            on_image(result)
+        return result
 
     def generate_delegated(self, requests, on_image):
         for index, (prompt, references) in enumerate(requests):
@@ -438,6 +484,32 @@ def test_preview_quota_reuse_and_selected_regeneration(controlled_worker, sprite
     assert before[0] != after[0] and before[1:] == after[1:]
     assert len(provider.calls) == 5 and provider.calls[-1] == (request["prompt"], len(request["images"]))
     assert request["prompt"].index("Copper") < request["prompt"].index("Brass")
+
+
+def test_recovered_attempt_preserves_provider_id(controlled_worker, sprite, provider, monkeypatch):
+    ops, invoke, run_next = controlled_worker
+    _, job = import_job(invoke, sprite)
+    oid = invoke("generate", job["job_id"], "--tile", 1, 1)["operation_id"]
+    original_generate = provider.generate
+
+    def cancel_after_delivery(item, pause, cancel, report):
+        def deliver(*args, **kwargs):
+            result = original_generate(*args, **kwargs)
+            cancel.set()
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(provider, "generate", deliver)
+            return cli.run_operation(ops.root, item, pause, cancel, report)
+
+    run_next(cancel_after_delivery)
+    assert invoke("operation", "status", oid)["state"] == "canceled"
+    assert invoke("tile", "show", job["job_id"], 1, 1)["attempt_pending"]
+    invoke("operation", "resume", oid)
+    run_next()
+    assert invoke("operation", "status", oid)["state"] == "completed"
+    assert invoke("tile", "show", job["job_id"], 1, 1)["generation_id"] == "simulated-1"
+    assert len(provider.calls) == 1
 
 
 def test_scale_batch_modes_and_resume(controlled_worker, sprite, provider, tmp_path):
@@ -538,6 +610,150 @@ def test_new_batch_verifies_shared_cache(controlled_worker, sprite, provider, tm
         assert following["job_id"] == second["job_id"]
         assert checksum.is_file()
     assert len(provider.calls) == 8
+
+
+def test_saved_stage_validates_input_before_use(controlled_worker, sprite, tmp_path):
+    ops, invoke, run_next = controlled_worker
+    imported = invoke("source", "import", sprite)
+    store = Store(ops.root)
+    source = store.list_sources(imported["source_id"])[0]
+    job = store.ensure_job(source, Grid(2, 2), 4, input_revision="saved-stage", input_scale=2)
+    with Image.open(sprite) as original:
+        original.resize((80, 48)).save(job.input_path)
+    cache = job.input_path.read_bytes()
+    job.input_path.with_suffix(".sha256").write_text(sha256(cache).hexdigest(), encoding="ascii")
+    for cell in job.layout.cells:
+        seed_tile(store, job, cell)
+    Image.new("RGB", (80, 48), "red").save(job.input_path)
+    output = tmp_path / "stage.png"
+    invoke("job", "adopt-input", job.id, error="INVALID_STAGE_INPUT")
+    invoke("tile", "references", job.id, 1, 1, "--output-dir", tmp_path / "references", error="INVALID_STAGE_INPUT")
+    invoke("inspect", job.id, "--view", "compare", "--output", output, error="INVALID_STAGE_INPUT")
+    for request in (("generate", job.id, "--tile", 1, 1, "--regenerate"),
+                    ("export", job.id, "--format", "png", "--output", output),
+                    ("job", "refresh-previews", job.id)):
+        oid = invoke(*request)["operation_id"]
+        run_next()
+        result = invoke("operation", "status", oid)
+        assert result["state"] == "failed" and result["error"]["code"] == "INVALID_STAGE_INPUT"
+    assert not output.exists()
+    invoke("inspect", job.id, "--view", "original", "--output", tmp_path / "original.png")
+    job.input_path.write_bytes(cache)
+    oid = invoke("export", job.id, "--format", "png", "--output", output)["operation_id"]
+    run_next()
+    assert invoke("operation", "status", oid)["state"] == "completed"
+    with Image.open(output) as image:
+        assert image.mode == "RGBA" and image.getpixel((0, 0))[3] == 0
+
+
+def test_adopt_input_preserves_legacy_job_after_upstream_changes(controlled_worker, sprite, provider, tmp_path):
+    ops, invoke, run_next = controlled_worker
+    source = invoke("source", "import", sprite)
+
+    def run_batch():
+        oid = invoke("batch", "start", source["source_id"], "--scales", 2, 4, "--input-mode", "previous",
+                     "--output-dir", tmp_path)["operation_id"]
+        run_next()
+        result = invoke("operation", "status", oid)
+        assert result["state"] == "completed", result
+        return result["progress"]["outputs"]
+
+    upstream, historical = run_batch()
+    cache = Path(historical["input_path"])
+    expected = sha256(cache.read_bytes()).hexdigest()
+    cache.with_suffix(".sha256").unlink()
+    store = Store(ops.root)
+    parent = store.recent_jobs(job_id=upstream["job_id"])[0]
+    cell = parent.layout.cells[0]
+    old = store.snapshot(parent).tiles[cell].artifact
+    store.begin_tile(parent, cell, "new-upstream")
+    Image.new("RGB", (FRAME, FRAME), "red").save(parent.folder / "new-upstream.png")
+    store.finish_tile(parent, cell, "new-upstream", "upstream-image", None, {})
+    old.unlink()
+    _, current = run_batch()
+    assert historical["job_id"] != current["job_id"]
+
+    destination = tmp_path / "historical.png"
+    invoke("inspect", historical["job_id"], "--output", destination, error="INVALID_STAGE_INPUT")
+    adopted = invoke("job", "adopt-input", historical["job_id"])
+    assert adopted["sha256"] == expected and adopted["input_revision"] == historical["input_revision"]
+    assert invoke("job", "adopt-input", historical["job_id"]) == adopted
+    oid = invoke("export", historical["job_id"], "--format", "png", "--output", destination)["operation_id"]
+    run_next()
+    assert invoke("operation", "status", oid)["state"] == "completed"
+    assert destination.read_bytes() == Path(historical["path"]).read_bytes()
+
+
+@pytest.mark.parametrize(("format_name", "replaced"), [
+    ("png", False), ("tiles-zip", False), ("tile-png", False), ("tile-png", True),
+])
+def test_export_replay_recovers_published_file(controlled_worker, sprite, tmp_path, format_name, replaced):
+    ops, invoke, run_next = controlled_worker
+    source = invoke("source", "import", sprite)
+    store = Store(ops.root)
+    job = store.ensure_job(store.list_sources(source["source_id"])[0], Grid(2, 2), 2)
+    for cell in job.layout.cells:
+        seed_tile(store, job, cell)
+    output = tmp_path / ("export.zip" if format_name == "tiles-zip" else "export.png")
+    args = ("export", job.id, "--format", format_name, "--output", output, "--request-id", "export-id")
+    if format_name == "tile-png":
+        args += ("--tile", 1, 1)
+    oid = invoke(*args)["operation_id"]
+
+    def crash_after_publish(item, pause, cancel, report):
+        def interrupt(**changes):
+            if "outputs" in changes:
+                raise SystemExit("Simulated crash after the rename.")
+            report(**changes)
+
+        return cli.run_operation(ops.root, item, pause, cancel, interrupt)
+
+    with pytest.raises(SystemExit):
+        run_next(crash_after_publish)
+    if replaced:
+        other = tmp_path / "another.png"
+        Image.new("RGB", (5, 5), "red").save(other)
+        other.replace(output)
+        result = invoke(*args)
+        assert result["operation_id"] == oid and result["state"] == "interrupted"
+        assert "outputs" not in result["progress"]
+        return
+    before = output.stat().st_mtime_ns
+    if format_name == "tiles-zip":
+        resumed = invoke("operation", "resume", oid)
+        assert resumed["state"] == "completed" and resumed["operation_id"] == oid
+    result = invoke(*args)
+    assert result["operation_id"] == oid and result["state"] == "completed"
+    assert result["progress"]["outputs"][0]["path"] == str(output)
+    assert result["progress"]["outputs"][0]["format"] == format_name
+    assert output.stat().st_mtime_ns == before
+
+
+def test_unpublished_export_can_resume(controlled_worker, sprite, tmp_path):
+    ops, invoke, run_next = controlled_worker
+    source = invoke("source", "import", sprite)
+    store = Store(ops.root)
+    job = store.ensure_job(store.list_sources(source["source_id"])[0], Grid(2, 2), 2)
+    seed_tile(store, job, job.layout.cells[0])
+    output = tmp_path / "tile.png"
+    oid = invoke("export", job.id, "--format", "tile-png", "--tile", 1, 1, "--output", output)["operation_id"]
+
+    def crash_before_publish(item, pause, cancel, report):
+        def interrupt(**changes):
+            report(**changes)
+            if "export_publication" in changes:
+                raise SystemExit("Simulated crash before the rename.")
+
+        return cli.run_operation(ops.root, item, pause, cancel, interrupt)
+
+    with pytest.raises(SystemExit):
+        run_next(crash_before_publish)
+    assert not output.exists()
+    assert invoke("operation", "status", oid)["state"] == "interrupted"
+    assert invoke("operation", "resume", oid)["operation_id"] == oid
+    run_next()
+    assert invoke("operation", "status", oid)["state"] == "completed"
+    assert output.is_file()
 
 
 def test_chained_batch_resume_hides_outdated_downstream_output(controlled_worker, sprite, provider, tmp_path):
