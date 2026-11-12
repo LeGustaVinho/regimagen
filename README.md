@@ -1,8 +1,17 @@
 # Regimagen
 
-Regimagen reconstructs images at larger resolutions using Codex ImageGen. It divides the input into overlapping tiles, regenerates each tile with new visual detail, and blends the results into a single sRGB PNG. Use the Windows desktop app for visual review or the JSON CLI for automation.
+[![Latest GitHub release](https://img.shields.io/github/v/release/LeGustaVinho/regimagen?display_name=tag&sort=semver&label=release&color=2f6feb)](https://github.com/LeGustaVinho/regimagen/releases/latest)
+[![Windows 10 and 11 x64](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4)](#quick-start)
+[![CLI JSON schema v1](https://img.shields.io/badge/CLI-JSON%20v1-2EA043)](docs/CLI.md)
+[![Python 3.14](https://img.shields.io/badge/Python-3.14-3776AB?logo=python&logoColor=white)](#develop-from-source)
 
-[Download for Windows x64](https://github.com/LeGustaVinho/regimagen/releases/latest) · [CLI reference](docs/CLI.md) · [Report an issue](https://github.com/LeGustaVinho/regimagen/issues/new)
+**Generative image reconstruction with Codex ImageGen.** Regimagen divides a source image into overlapping tiles, regenerates them with new visual detail, and blends the results into a lossless sRGB PNG. Review the reconstruction in the Windows app or automate it through the JSON CLI.
+
+[Download Windows ZIP](https://github.com/LeGustaVinho/regimagen/releases/latest/download/Regimagen-Windows-x64.zip) · [CLI reference](docs/CLI.md) · [Report an issue](https://github.com/LeGustaVinho/regimagen/issues/new)
+
+![Regimagen desktop with the original image, a four-tile reconstruction preview, and the job controls](docs/assets/desktop.png)
+
+*The desktop app showing a 2×2 preview within a 4×4 job, using simulated tiles.*
 
 ## Features
 
