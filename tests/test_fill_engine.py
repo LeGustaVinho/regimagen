@@ -81,6 +81,22 @@ def test_frame_is_square_and_first_input_is_source_even_at_canvas_edge():
     assert tuple(result[50, 6]) == (0, 0, 255)
 
 
+def test_opaque_fill_matches_smooth_edge_tones_without_fading_foreground():
+    base = Image.new("RGB", (320, 320), (70, 100, 130))
+    generated = Image.new("RGB", base.size, (82, 114, 146))
+    generated.paste((181, 87, 37), (54, 148, 86, 180))
+    mask = Image.new("L", base.size)
+    mask.paste(255, (48, 48, 272, 272))
+
+    output = render_fill(base, mask, _candidate(generated, feather=5), edit_alpha=False).compose(base)
+
+    outside = np.asarray(mask) == 0
+    np.testing.assert_array_equal(np.asarray(output)[outside], np.asarray(base)[outside])
+    assert max(abs(a - b) for a, b in zip(output.getpixel((54, 90)), base.getpixel((54, 90)))) <= 2
+    assert output.getpixel((58, 160)) == generated.getpixel((58, 160))
+    assert output.getpixel((160, 160)) == generated.getpixel((160, 160))
+
+
 def test_sprite_context_shows_neighborhood_and_global_subject():
     base = Image.new("RGBA", (500, 200), (231, 2, 97, 0))
     base.paste((17, 143, 70, 255), (94, 80, 110, 120))

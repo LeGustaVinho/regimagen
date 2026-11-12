@@ -551,7 +551,7 @@ def _sample_candidate(
 def _blend(
     original: np.ndarray, mask: np.ndarray, distance: np.ndarray, candidate: np.ndarray,
     candidate_alpha: np.ndarray, color: np.ndarray, feather: int, edit_alpha: bool,
-    replace_core: np.ndarray | None = None,
+    replace_core: np.ndarray | None = None, *, soft_feather: int = 0,
 ) -> np.ndarray:
     source = LINEAR_RGB[original[..., :3]]
     source_alpha = original[..., 3:4].astype(np.float32) / 255 if original.shape[2] == 4 else 1.0
@@ -565,12 +565,29 @@ def _blend(
     if replace_core is not None:
         # The first pixel of a narrow approved band still needs a soft edge.
         distance = np.maximum(0, distance - 0.5)
+    color_correction = color * (1 - _smoothstep(distance / (2 * feather)))[..., None]
+    if soft_feather > feather and np.any(mask == 0):
+        # Extend the transition where the two images show the same smooth
+        # surface and estimate its color drift from the unedited side.
+        kernel = np.ones((3, 3), np.uint8)
+        detail = np.maximum(cv2.morphologyEx(a, cv2.MORPH_GRADIENT, kernel),
+                            cv2.morphologyEx(b, cv2.MORPH_GRADIENT, kernel))
+        delta = source - candidate
+        smooth = (1 - _smoothstep(detail / 0.12)) * (1 - _smoothstep((np.abs(delta).max(axis=2) - 0.04) / 0.12))
+        smooth = cv2.GaussianBlur(smooth, (5, 5), 0)
+        width += (soft_feather - feather) * smooth
+        context = smooth * (mask == 0)
+        window = (2 * soft_feather + 1,) * 2
+        support = cv2.boxFilter(context, -1, window, borderType=cv2.BORDER_CONSTANT)
+        residual = cv2.boxFilter(delta * context[..., None], -1, window, borderType=cv2.BORDER_CONSTANT)
+        local_color = residual / np.maximum(support[..., None], 0.001)
+        strength = smooth * _smoothstep(support / 0.15) * (1 - _smoothstep(distance / soft_feather))
+        color_correction += (local_color - color_correction) * strength[..., None]
     weight = (_smoothstep(distance / width) * (mask.astype(np.float32) / 255))[..., None]
-    color_strength = (1 - _smoothstep(distance / (2 * feather)))[..., None]
     if replace_core is not None:
         weight[replace_core] = 1
-        color_strength[replace_core] = 0
-    candidate = np.clip(candidate + candidate_alpha * color * color_strength, 0, candidate_alpha)
+        color_correction[replace_core] = 0
+    candidate = np.clip(candidate + candidate_alpha * color_correction, 0, candidate_alpha)
     result = original.copy()
     if edit_alpha:
         alpha = source_alpha + (candidate_alpha - source_alpha) * weight
@@ -684,7 +701,11 @@ def render_fill(
 
     patch = base.crop((selection.left, selection.top, selection.right, selection.bottom))
     canvas = Rect(0, 0, *base.size)
-    margin = 2 * feather + 2
+    short_side = min(selection.width, selection.height)
+    soft_feather = 0
+    if base.mode == "RGB" and replace_core is None and short_side >= 96:
+        soft_feather = min(24, round(short_side * 0.16))
+    margin = max(2 * feather, soft_feather + 2) + 2
     work = selection.expand(margin, margin).intersect(canvas)
     assert work is not None
     channels, offset = _candidate_channels(candidate.image, _candidate_box(candidate.image.width, work, crop, shift))
@@ -704,7 +725,8 @@ def render_fill(
         box = _candidate_box(candidate.image.width, expanded, crop, shift)
         pixels, alpha = _sample_candidate(channels, expanded, box, offset)
         core = np.asarray(replace_core.crop(expanded_box)) != 0 if replace_core is not None else None
-        blended = _blend(original, selected, distance, pixels, alpha, color, feather, edit_alpha, core)
+        blended = _blend(original, selected, distance, pixels, alpha, color, feather, edit_alpha, core,
+                         soft_feather=soft_feather)
         patch.paste(Image.fromarray(blended[part]), (0, top - selection.top))
 
     preview = FillPreview(patch, (selection.left, selection.top))
