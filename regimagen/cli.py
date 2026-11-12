@@ -526,7 +526,7 @@ def command_parser():
         ("wait", "Wait for completion or the timeout."),
         ("pause", "Pause generation after the active group."),
         ("cancel", "Cancel an operation and retain published files."),
-        ("resume", "Resume a generation or scale batch."),
+        ("resume", "Resume generation, a scale batch, or an interrupted export."),
     ):
         command = leaf(operations, action, description)
         command.add_argument("operation_id")

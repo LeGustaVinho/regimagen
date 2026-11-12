@@ -39,6 +39,12 @@ try {
         }
     }
     Copy-Item -LiteralPath (Join-Path $regimagenRoot 'README.md') -Destination $regimagenPortable -Force
+    Copy-Item -LiteralPath (Join-Path $regimagenRoot 'THIRD_PARTY_NOTICES.md') -Destination $regimagenPortable -Force
+    Copy-Item -LiteralPath (Join-Path $regimagenRoot 'docs') -Destination $regimagenPortable -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $regimagenRoot 'licenses') -Destination $regimagenPortable -Recurse -Force
+    $regimagenLicenses = Join-Path $regimagenPortable 'licenses'
+    uv run python -c "import sys; from importlib.metadata import distribution; from pathlib import Path; from shutil import copyfile; dest = Path(sys.argv[1]); bootloader = distribution('pyinstaller'); license_path = next(path for path in bootloader.files if path.name == 'COPYING.txt'); copyfile(Path(sys.base_prefix) / 'LICENSE.txt', dest / 'CPython.txt'); copyfile(bootloader.locate_file(license_path), dest / 'PyInstaller.txt')" $regimagenLicenses
+    if ($LASTEXITCODE -ne 0) { throw 'Could not bundle the Python and PyInstaller license texts.' }
     $regimagenArchive = Join-Path $regimagenDist 'Regimagen-Windows-x64.zip'
     Compress-Archive -LiteralPath $regimagenPortable -DestinationPath $regimagenArchive -Force
     Write-Output $regimagenArchive
