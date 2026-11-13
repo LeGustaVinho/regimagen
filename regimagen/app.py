@@ -1001,7 +1001,9 @@ class Window(QMainWindow):
         project = path.resolve() if path.suffix.lower() == PROJECT_SUFFIX else None
 
         def load(_update, _pause, cancel):
-            return load_project(project, cancelled=cancel.is_set) if project else Document.from_image(load_source(path), path.name)
+            if project is not None:
+                return load_project(project, cancelled=cancel.is_set)
+            return Document.from_image(load_source(path), path.name)
 
         def show(document):
             self._show_document(document, project)
@@ -1010,7 +1012,7 @@ class Window(QMainWindow):
 
         def open_document():
             message = "Opening project…" if project else "Opening image…"
-            self._launch("open_document", load, show, message=message)
+            self._launch("open_document", load, show, message=message, cancellable=True, discard_on_cancel=True)
 
         if self._confirm_replace(open_document):
             open_document()
@@ -1175,7 +1177,10 @@ class Window(QMainWindow):
             return Document.from_image(image, source.name)
 
         def open_document():
-            self._launch("open_document", load, self._show_document, message="Opening image…")
+            self._launch(
+                "open_document", load, self._show_document, message="Opening image…", cancellable=True,
+                discard_on_cancel=True,
+            )
 
         if self._confirm_replace(open_document):
             open_document()
@@ -1200,7 +1205,7 @@ class Window(QMainWindow):
         def open_document():
             self._launch(
                 "open_result", load, self._show_document, lambda counts: self._file_progress("Rendering result", counts),
-                message="Rendering result…", cancellable=True,
+                message="Rendering result…", cancellable=True, discard_on_cancel=True,
             )
 
         if self._confirm_replace(open_document):
@@ -1799,9 +1804,12 @@ class Window(QMainWindow):
 
     def _launch(
         self, name: str, operation, succeeded=None, updated=None, *, message: str,
-        progress: tuple[int, int] | None = None, cancellable: bool = False,
+        progress: tuple[int, int] | None = None, cancellable: bool = False, discard_on_cancel: bool = False,
     ):
         def complete(result):
+            if discard_on_cancel and self.task.cancelled.is_set():
+                self._set_feedback("Open canceled.")
+                return
             self._set_feedback()
             if succeeded is not None:
                 succeeded(result)

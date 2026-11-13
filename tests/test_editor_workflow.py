@@ -503,6 +503,34 @@ def test_task_feedback_for_open_save_and_failed_export(window, tmp_path, monkeyp
     assert destination.read_bytes() == saved_tile
 
 
+
+def test_cancel_open_preserves_the_current_document(window, tmp_path, monkeypatch):
+    current = desktop.Document.from_image(Image.new("RGB", (24, 24), "red"), "Current.png")
+    window._show_document(current)
+    release = Event()
+    opened = tmp_path / "Slow.png"
+    opened.touch()
+
+    def load(_path):
+        assert release.wait(5)
+        return Image.new("RGB", (24, 24), "navy")
+
+    monkeypatch.setattr(desktop, "load_source", load)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_, **_options: (str(opened), ""))
+    window.open_action.trigger()
+    try:
+        assert window.task_status.text() == "Opening image…"
+        assert window.cancel_task.isEnabled() and window.cancel_task.isVisible()
+        window.cancel_task.click()
+        assert window.task_status.text() == "Cancelling…" and not window.cancel_task.isEnabled()
+    finally:
+        release.set()
+    idle(window)
+    assert window.task_status.text() == "Open canceled."
+    assert window.editor.document is current
+    assert window.task_progress.isHidden() and window.cancel_task.isHidden()
+
+
 def test_preview_and_regeneration_report_the_requested_tiles(window, monkeypatch):
     document = desktop.Document.from_image(Image.new("RGB", (32, 32), "red"), "Base.png")
     window._show_document(document)
