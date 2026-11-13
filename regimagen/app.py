@@ -31,7 +31,7 @@ from .fill_editor import FillEditor
 from .geometry import (
     DEFAULT_SCALES, MAX_PNG_DIMENSION, MIN_COLUMNS, MIN_ROWS, Cell, Grid, Layout, plan_scales, suggested_grid,
 )
-from .jobs import load_job_input, pending_cells, refresh_thumbnails, run_scale_batch, run_tiles
+from .jobs import RunOutcome, load_job_input, pending_cells, refresh_thumbnails, run_scale_batch, run_tiles
 from .project import PROJECT_SUFFIX, load_project, save_project
 from .remove_detection import detect_removal, segment_removal_click, segment_removal_lasso
 from .remove_editor import RemoveEditor
@@ -283,6 +283,7 @@ class Window(QMainWindow):
         self.export_message = ""
         self.output_folder: Path | None = None
         self.can_cancel_task = False
+        self.recover_task: Callable[[], None] | None = None
         self.setWindowTitle("Regimagen")
         self.setWindowIcon(QIcon(logo()))
         self.setAcceptDrops(True)
@@ -412,6 +413,10 @@ class Window(QMainWindow):
         self.cancel_task.clicked.connect(self._request_cancel)
         self.cancel_task.hide()
         row.addWidget(self.cancel_task)
+        self.retry_task = QPushButton()
+        self.retry_task.clicked.connect(self._recover_task)
+        self.retry_task.hide()
+        row.addWidget(self.retry_task)
         self.open_folder = QPushButton("Open folder")
         self.open_folder.setObjectName("openOutputFolder")
         self.open_folder.clicked.connect(self._open_output_folder)
@@ -1285,7 +1290,7 @@ class Window(QMainWindow):
         self.comparison.select(cell, focus=True)
         self._refresh()
 
-    def _refresh(self):
+    def _refresh(self, *, snapshot: Snapshot | None = None):
         busy = self.task is not None
         page = self.stack.currentWidget()
         comparing = page is self.comparison
@@ -1327,7 +1332,8 @@ class Window(QMainWindow):
             return
         self.comparison.fill_button.setEnabled(self.source is not None and not busy)
         layout = self.image_layout
-        snapshot = self._snapshot()
+        if snapshot is None:
+            snapshot = self._snapshot()
         ready = len(snapshot.current_artifacts)
         review = sum(tile.warning is not None and not tile.stale for tile in snapshot.tiles.values())
         count = layout.grid.count if layout else 0
@@ -1356,8 +1362,9 @@ class Window(QMainWindow):
         self.edit_result.setEnabled(self.export.isEnabled())
         self.parts.setEnabled(ready > 0 and not busy)
         if self.operation in ("generate", "scale_batch"):
-            self.generate.setText("Pause")
-            self.generate.setEnabled(not self.task.pause.is_set())
+            pausing = self.task.pause.is_set()
+            self.generate.setText("Pausing…" if pausing else "Pause")
+            self.generate.setEnabled(not pausing and not self.task.cancelled.is_set())
         else:
             remaining = ready < count or any(tile.attempt for tile in snapshot.tiles.values())
             if count and ready == count and not remaining:
@@ -1385,12 +1392,6 @@ class Window(QMainWindow):
             self.comparison.update_tiles(snapshot)
 
     def _status_text(self, layout: Layout | None, snapshot: Snapshot, ready: int, review: int) -> str:
-        if self.operation == "import":
-            return "Opening image…"
-        if self.operation == "open_fill":
-            return "Opening Generative Fill…"
-        if self.operation == "refresh_preview":
-            return "Refreshing preview…"
         if layout is None:
             return "Open an image to configure the grid."
         if layout.grid_error:
@@ -1398,21 +1399,15 @@ class Window(QMainWindow):
         if not layout.enlarges:
             suggestion = suggested_grid(layout.source_width, layout.source_height)
             return f"This grid is too small to enlarge the image. Use {suggestion.columns}×{suggestion.rows}."
-        if self.operation in ("generate", "scale_batch") and self.task.pause.is_set():
-            return "Pausing after the active edits finish…"
-        if self.active is not None:
-            if self.subagents.isChecked():
-                return f"Generating with subagents · {ready}/{layout.grid.count} ready"
-            return f"Editing · {self.active.label.lower()} · {ready}/{layout.grid.count} ready"
-        if snapshot.notice:
+        summary = f"{ready}/{layout.grid.count} ready" + (f" · {review} to review" if review else "")
+        if snapshot.notice and not self.task_status.text():
             notice = snapshot.notice
-            if snapshot.quota_reset:
-                timestamp = datetime.fromtimestamp(snapshot.quota_reset)
-                notice += f" Resets at {timestamp:%Y-%m-%d %H:%M}."
-            return f"{notice}\n{self.export_message}" if self.export_message else notice
+            if timestamp := quota_reset_text(snapshot.quota_reset):
+                notice += f" Resets at {timestamp}."
+            return f"{summary}\n{notice}"
         if self.export_message:
-            return self.export_message
-        return f"{ready}/{layout.grid.count} ready" + (f" · {review} to review" if review else "")
+            return f"{summary}\n{self.export_message}"
+        return summary
 
     def _choose_codex(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1427,41 +1422,79 @@ class Window(QMainWindow):
         self.settings_button.setToolTip("Detect the Codex CLI automatically")
 
     def _generate_or_pause(self):
-        if self.operation in ("generate", "scale_batch") and self.task is not None:
-            self.task.pause.set()
-            self._refresh()
-        elif self.image_layout:
+        if self.task is not None:
+            if self.operation in ("generate", "scale_batch") and not self.task.cancelled.is_set():
+                self.task.pause.set()
+                self._set_feedback("Pausing after the current work finishes…", busy=True)
+                self._refresh()
+            return
+        if self.image_layout:
             self._start(self.image_layout.cells)
 
     def _start_preview(self):
         if self.image_layout:
-            self._start(self.image_layout.preview(self.selected))
+            self._start(self.image_layout.preview(self.selected), preview=True)
 
     def _retry(self):
         if self.selected is not None:
             self._start((self.selected,), replace=True)
 
-    def _start(self, selection, *, replace=False):
+    def _start(self, selection: tuple[Cell, ...], *, preview=False, replace=False):
         layout = self.image_layout
         if self.task is not None or layout is None or layout.grid_error or not layout.enlarges:
             return
         job = self.job or self.store.ensure_job(self.source, layout.grid)
         self.job = job
-        cells = list(selection) if replace else pending_cells(self.store.snapshot(job), selection)
+        snapshot = self.store.snapshot(job)
+        cells = selection if replace else pending_cells(snapshot, selection)
         if not cells:
             return
-        self.export_message = ""
+        previous = None
+        if replace:
+            cell = selection[0]
+            previous = snapshot.tiles[cell].artifact
+            action = "Regenerate tile" if previous else "Generate tile"
+            subject = "Tile regeneration" if previous else "Tile generation"
+            label = f"{'Regenerating' if previous else 'Generating'} tile · {cell.label}"
+            success = f"{cell.label} · {'Tile regenerated' if previous else 'Tile ready'}."
+        elif preview:
+            action = "Generate 2×2 preview"
+            subject = "Preview"
+            label = "Preview 2×2"
+            success = f"Preview ready. {len(selection)} tiles available for reconstruction."
+        else:
+            action = "Resume job"
+            subject = label = "Reconstruction"
+            success = "Reconstruction complete. Export the PNG or open the result in the editor."
         self._history()
         use_subagents = self.subagents.isChecked()
         executable = self._codex_resolver()
 
         def generate(update, pause, cancel):
-            run_tiles(
+            return run_tiles(
                 self.store, job, cells, executable, pause=pause, cancelled=cancel,
                 on_change=update, subagents=use_subagents,
             )
 
-        self._launch("generate", generate, updated=self._generation_update, message="Generating tiles…")
+        def update(active):
+            self._generation_update(active, label, selection, previous=previous)
+
+        def recover():
+            if self.job == job:
+                self._start(selection, preview=preview, replace=replace)
+
+        def finished(outcome):
+            retry = (action, recover) if outcome.state != "completed" else None
+            message = self._run_message(outcome, subject, success, "")
+            if retry is not None and (preview or replace):
+                message += f" Target starts at {selection[0].label.lower()}." if preview else f" {selection[0].label}."
+            self._set_feedback(message, recovery=retry)
+
+        ready, total = len(selection) - len(cells), len(selection)
+        self._launch(
+            "generate", generate, finished, update,
+            message=self._tiles_message(label, ready, total), progress=(ready, total),
+        )
 
     def _codex_resolver(self) -> Callable[[], Path]:
         custom = self.settings.value("codex", "", str)
@@ -1580,7 +1613,7 @@ class Window(QMainWindow):
         elif isinstance(update, str):
             self.status.setText(update)
         else:
-            self._generation_update(update)
+            self._generation_update(update, "Generating tiles", self.job.layout.cells)
 
     def _batch_finished(self, result):
         if result is not None:
@@ -1589,9 +1622,35 @@ class Window(QMainWindow):
             self.status.setToolTip(str(folder))
         self._history()
 
-    def _generation_update(self, active: Cell | None):
+    def _generation_update(self, active: Cell | None, label: str, cells: tuple[Cell, ...], *, previous=None):
         self.active = active
-        self._refresh()
+        snapshot = self._snapshot()
+        self._report_tiles(label, snapshot, cells, previous=previous)
+        self._refresh(snapshot=snapshot)
+
+    def _report_tiles(self, label: str, snapshot: Snapshot, cells: tuple[Cell, ...], *, previous=None):
+        ready = len(cells) - len(pending_cells(snapshot, cells))
+        if previous is not None and snapshot.tiles[cells[0]].artifact == previous:
+            ready = 0
+        self._report_progress(self._tiles_message(label, ready, len(cells)), (ready, len(cells)))
+
+    @staticmethod
+    def _tiles_message(label: str, ready: int, total: int) -> str:
+        return f"{label} · {ready}/{total} tiles ready" if total > 1 else label
+
+    @staticmethod
+    def _run_message(outcome: RunOutcome, subject: str, success: str, resume: str) -> str:
+        if outcome.state == "completed":
+            return success
+        if outcome.state in ("paused", "canceled"):
+            message = f"{subject} {outcome.state}. Completed tiles are saved."
+        elif outcome.state == "quota_limited":
+            message = f"{quota_message(outcome.quota_reset, 'Resume')} Completed tiles are saved."
+        elif outcome.code == "AUTH_REQUIRED":
+            message = f"{subject} requires Codex sign-in. Run codex login."
+        else:
+            message = f"{subject} failed. {outcome.message or ''}".rstrip()
+        return f"{message} {resume}".rstrip()
 
     def _export(self, *, parts=False):
         job = self.job
@@ -1637,7 +1696,7 @@ class Window(QMainWindow):
 
     def _set_feedback(
         self, message: str = "", *, busy: bool = False, progress: tuple[int, int] | None = None,
-        folder: Path | None = None,
+        folder: Path | None = None, recovery: tuple[str, Callable[[], None]] | None = None,
     ):
         self.task_status.setText(message)
         if progress is not None:
@@ -1652,6 +1711,16 @@ class Window(QMainWindow):
         self.output_folder = folder
         self.open_folder.setToolTip(str(folder) if folder is not None else "")
         self.open_folder.setVisible(folder is not None)
+        self.recover_task = None
+        if recovery is not None:
+            label, self.recover_task = recovery
+            self.retry_task.setText(label)
+        self.retry_task.setVisible(recovery is not None)
+        self.retry_task.setEnabled(self.task is None)
+
+    def _recover_task(self):
+        if self.task is None and self.recover_task is not None:
+            self.recover_task()
 
     def _report_progress(self, message: str, progress: tuple[int, int] | None = None):
         if self.task is not None and not (self.task.pause.is_set() or self.task.cancelled.is_set()):
@@ -1734,6 +1803,7 @@ class Window(QMainWindow):
         self.task = None
         self.operation = ""
         self.active = None
+        self.retry_task.setEnabled(self.recover_task is not None)
         after_task, self.after_task = self.after_task, None
         self._refresh()
         if self.closing:

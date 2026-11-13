@@ -11,10 +11,11 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, Q
 
 import regimagen.app as desktop
 import regimagen.editor as editor_module
+import regimagen.jobs as jobs
 from regimagen.codex import Cancelled
 from regimagen.document import render
 from regimagen.fill import FillCandidate
-from regimagen.geometry import FRAME, Grid
+from regimagen.geometry import FRAME, Cell, Grid
 from regimagen.project import load_project
 from regimagen.storage import Store
 
@@ -477,3 +478,97 @@ def test_task_feedback_for_open_save_and_failed_export(window, tmp_path, monkeyp
     window.export.click()
     assert window.task is None and warnings and "managed files" in warnings[0]
     assert destination.read_bytes() == saved_tile
+
+
+def test_preview_and_regeneration_report_the_requested_tiles(window, monkeypatch):
+    document = desktop.Document.from_image(Image.new("RGB", (32, 32), "red"), "Base.png")
+    window._show_document(document)
+    window.editor.reconstruct_button.click()
+    idle(window)
+    job = window.store.ensure_job(window.source, Grid(4, 4))
+    window._show_grid(job.grid, job)
+    preview = job.layout.preview()
+
+    def save_tile(cell, attempt):
+        window.store.begin_tile(job, cell, attempt)
+        Image.new("RGB", (FRAME, FRAME), "navy").save(job.folder / f"{attempt}.png")
+        window.store.finish_tile(job, cell, attempt, "mock", None, {})
+
+    save_tile(preview[0], "cached")
+    release = Event()
+    requests = []
+
+    def generate(_store, _job, cells, _executable, *, on_change, **_kwargs):
+        requests.append(tuple(cells))
+        on_change(cells[0])
+        assert release.wait(5)
+        for index, cell in enumerate(cells):
+            save_tile(cell, f"request-{len(requests)}-tile-{index}")
+        on_change(None)
+        return jobs.RunOutcome()
+
+    monkeypatch.setattr(desktop, "run_tiles", generate)
+    window.preview.click()
+    try:
+        wait_for(lambda: window.active is not None)
+        assert window.task_status.text() == "Preview 2×2 · 1/4 tiles ready"
+        assert window.task_progress.value() == 1 and window.task_progress.maximum() == 4
+        assert window.status.text() == "1/16 ready"
+        window.grid_map.picked.emit(Cell(0, 0))
+        assert window.task_status.text() == "Preview 2×2 · 1/4 tiles ready"
+    finally:
+        release.set()
+    idle(window)
+    assert requests == [preview[1:]] and window.status.text() == "4/16 ready"
+    assert window.task_status.text().startswith("Preview ready.")
+
+    release.clear()
+    window.grid_map.picked.emit(preview[0])
+    window.retry.click()
+    try:
+        wait_for(lambda: window.active is not None)
+        assert window.task_status.text() == f"Regenerating tile · {preview[0].label}"
+        assert window.task_progress.value() == 0 and window.task_progress.maximum() == 1
+    finally:
+        release.set()
+    idle(window)
+    assert requests[-1] == (preview[0],)
+    assert "Tile regenerated" in window.task_status.text()
+
+
+def test_preview_recovery_keeps_the_requested_region_when_the_quota_time_is_unavailable(window, monkeypatch):
+    document = desktop.Document.from_image(Image.new("RGB", (32, 32), "red"), "Base.png")
+    window._show_document(document)
+    window.editor.reconstruct_button.click()
+    idle(window)
+    window._show_grid(Grid(4, 4))
+    preview = window.image_layout.preview()
+    release = Event()
+    requests = []
+
+    def generate(store, job, cells, _executable, *, on_change, **_kwargs):
+        requests.append(tuple(cells))
+        on_change(cells[0])
+        assert release.wait(5)
+        store.set_notice(job, "Codex has reached its usage limit.", "unknown")
+        return jobs.RunOutcome("quota_limited", quota_reset="unknown")
+
+    monkeypatch.setattr(desktop, "run_tiles", generate)
+    window.preview.click()
+    try:
+        wait_for(lambda: window.active is not None)
+        window.grid_map.picked.emit(Cell(0, 0))
+    finally:
+        release.set()
+    idle(window)
+    assert window.task_progress.isHidden()
+    assert "Resume when the limit resets." in window.task_status.text()
+    assert preview[0].label.lower() in window.task_status.text()
+    assert window.retry_task.isVisible() and window.retry_task.isEnabled()
+    window.retry_task.click()
+    idle(window)
+    assert requests == [preview, preview]
+
+    window._show_grid(window.grid, window.job)
+    assert "Codex has reached its usage limit." in window.status.text()
+    assert window.retry_task.isHidden()
