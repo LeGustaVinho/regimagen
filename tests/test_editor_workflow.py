@@ -292,6 +292,77 @@ def test_completed_strokes_are_ordered_before_undo_and_save(window, tmp_path, mo
     assert render(editor.document).getpixel((60, 40))[3] == 255
 
 
+def test_layered_fill_recovers_when_background_apply_fails(window, monkeypatch):
+    from regimagen.document_fill import layered_variant
+    from regimagen.fill import FillPreview
+
+    editor = window.editor
+    original = desktop.Document.from_image(Image.new("RGBA", (70, 70), "red"), "Fill")
+    window._show_document(original)
+    editor.fill_button.click()
+    idle(window)
+    session = window.layer_fill
+    selection = Image.new("L", original.size)
+    selection.paste(255, (10, 10, 20, 20))
+    session.editor._mask = selection
+    preview = FillPreview(Image.new("RGBA", (10, 10), "green"), (10, 10))
+    variant = layered_variant(original, selection, preview, None)
+    window._append_layer_variant(variant)
+    started, release = Event(), Event()
+
+    def fail(_mask):
+        started.set()
+        assert release.wait(5)
+        raise RuntimeError("Could not prepare the selection.")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(editor_module._Selection, "prepare", staticmethod(fail))
+        try:
+            session.editor._apply.click()
+            wait_for(started.is_set)
+            assert not session.editor._apply.isEnabled()
+            window._apply_layer_fill()
+            window._close_layer_fill()
+            assert window.layer_fill is session
+        finally:
+            release.set()
+        idle(window)
+    assert window.layer_fill is session and session.editor._apply.isEnabled()
+    assert editor.document is original and not editor.undo.canUndo()
+    session.editor._apply.click()
+    idle(window)
+    assert window.layer_fill is None and editor.document is variant.document and editor.undo.count() == 1
+
+
+def test_queued_drags_accumulate_layer_displacement(window, monkeypatch):
+    editor = window.editor
+    original = desktop.Document.from_image(Image.new("RGBA", (120, 90)), "Layer")
+    window._show_document(original)
+    choose_tool(editor, "brush")
+    started, release = Event(), Event()
+    real_paint = editor_module.paint
+
+    def paint(*args, **kwargs):
+        started.set()
+        assert release.wait(5)
+        return real_paint(*args, **kwargs)
+
+    monkeypatch.setattr(editor_module, "paint", paint)
+    try:
+        gesture(editor.canvas, (24, 26), (28, 32), wait=False)
+        wait_for(started.is_set)
+        choose_tool(editor, "move")
+        gesture(editor.canvas, (20, 20), (30, 20), wait=False)
+        gesture(editor.canvas, (30, 20), (40, 20), wait=False)
+        assert editor.document is original
+    finally:
+        release.set()
+    idle(window)
+    assert editor.active_layer.x == 20 and editor.undo.count() == 3
+    editor.undo.undo()
+    assert editor.active_layer.x == 10
+
+
 def test_color_adjustments_preview_cancel_and_undo(window):
     editor = window.editor
     original = desktop.Document.from_image(Image.new("RGBA", (40, 30), (100, 45, 20, 200)), "Paint")

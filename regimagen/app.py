@@ -107,6 +107,7 @@ class LayerFillSession:
     editor: FillEditor
     target: ActiveFillTarget | None
     variants: list[LayeredVariant] = field(default_factory=list)
+    applying: bool = False
 
 
 def tile_state(tile: Tile) -> tuple[str, str]:
@@ -642,7 +643,7 @@ class Window(QMainWindow):
 
     def _remove_session(self):
         session = self.layer_fill
-        if self.task is not None or session is None or not isinstance(session.editor, RemoveEditor):
+        if self.task is not None or session is None or session.applying or not isinstance(session.editor, RemoveEditor):
             return None
         if session.document is not self.editor.document:
             self._close_layer_fill()
@@ -723,7 +724,7 @@ class Window(QMainWindow):
 
     def _apply_layer_fill(self):
         session = self.layer_fill
-        if session is None or self.task is not None or not session.editor.can_apply:
+        if session is None or session.applying or self.task is not None or not session.editor.can_apply:
             return
         if isinstance(session.editor, RemoveEditor):
             if self._remove_session() is None:
@@ -735,12 +736,25 @@ class Window(QMainWindow):
         else:
             selection = session.editor.mask
         variant = session.variants[session.editor.selected_variant]
+        session.applying = True
+        self.editor.set_message("")
+        self._refresh()
+
+        def applied():
+            session.applying = False
+            if self.editor.document is variant.document:
+                self._close_layer_fill()
+                self.editor.canvas.setFocus()
+            else:
+                session.editor.set_message(self.editor.message.text())
+                self._refresh()
+
         self.editor.apply_fill(variant.document, variant.layer_id, selection)
-        if not self.editor.after_edits(self._close_layer_fill):
-            self._close_layer_fill()
+        if not self.editor.after_edits(applied):
+            applied()
 
     def _close_layer_fill(self):
-        if self.layer_fill is None or self.task is not None:
+        if self.layer_fill is None or self.layer_fill.applying or self.task is not None:
             return
         editor = self.layer_fill.editor
         self.layer_fill = None
@@ -784,7 +798,7 @@ class Window(QMainWindow):
     def _generate_fill(self):
         layered = self.layer_fill
         session = layered or self.fill
-        if session is None or self.task is not None:
+        if session is None or self.task is not None or (layered is not None and layered.applying):
             return
         editor = session.editor
         if not editor.can_generate:
@@ -1287,6 +1301,7 @@ class Window(QMainWindow):
             self.setWindowTitle("Reconstruction — Regimagen")
             self.source_label.setText(f"{number(self.original.width())} × {number(self.original.height())} px")
         if session is not None:
+            busy = busy or (self.layer_fill is not None and self.layer_fill.applying)
             if isinstance(session.editor, RemoveEditor):
                 session.editor.set_busy(
                     busy, generating=self.operation == "generate_remove", detecting=self.operation == "detect_remove",

@@ -445,6 +445,15 @@ class Editor(QWidget):
         if not keep_gesture:
             self.canvas.cancel_gesture()
         self._state = state
+        if keep_gesture and self._start is not None and self.tool.currentData() == "move":
+            draft = self._preview.draft
+            if draft is not None:
+                before = previous.document.layer(state.active_id)
+                layer = self.active_layer
+                if before is not None and layer is not None:
+                    self._preview.update_draft(
+                        layer.id, x=draft[1]["x"] + layer.x - before.x, y=draft[1]["y"] + layer.y - before.y,
+                    )
         self._preview.set_document(state.document, reset=previous is None, keep_draft=keep_gesture)
         if previous is None or previous.selection is not state.selection:
             self._show_selection(state.selection)
@@ -745,9 +754,13 @@ class Editor(QWidget):
             self._points = [(math.floor(point.x()), math.floor(point.y()))]
 
     def _layer_position(self, point):
-        delta = point - self._start
+        dx, dy = self._drag_offset(point)
         layer = self.active_layer
-        return layer.x + round(delta.x()), layer.y + round(delta.y())
+        return layer.x + dx, layer.y + dy
+
+    def _drag_offset(self, point):
+        delta = point - self._start
+        return round(delta.x()), round(delta.y())
 
     def _pointer_move(self, point):
         if self._start is None:
@@ -764,12 +777,15 @@ class Editor(QWidget):
         layer = self.active_layer
         tool = self.tool.currentData()
         if tool == "move":
-            x, y = self._layer_position(point)
+            dx, dy = self._drag_offset(point)
             self._start = None
-            moved = (x, y) != (layer.x, layer.y)
+            moved = bool(dx or dy)
             self._preview.end_draft(commit=moved)
             if moved:
-                self._update_layer("Move layer", x=x, y=y)
+                self._edit_layer(
+                    "Move layer", layer.id, lambda _state, target: replace(target, x=target.x + dx, y=target.y + dy),
+                    keep_gesture=True,
+                )
         else:
             points, self._points = self._points, []
             points.append((math.floor(point.x()), math.floor(point.y())))
