@@ -17,10 +17,10 @@ from regimagen.storage import Store
 
 def _wait_for_task(window):
     deadline = time.monotonic() + 10
-    while window.task is not None and time.monotonic() < deadline:
+    while (window.task is not None or window.editor.edits_pending) and time.monotonic() < deadline:
         QApplication.processEvents()
         time.sleep(0.01)
-    assert window.task is None
+    assert window.task is None and not window.editor.edits_pending
 
 
 def _draw_rectangle(editor, start, end):
@@ -101,6 +101,7 @@ def test_remove_reviews_targets_then_applies_and_saves_a_replacement_layer(qt_ap
 
         _, footprint, _ = remove.removal_inputs()
         remove._apply.click()
+        _wait_for_task(window)
         assert window.layer_fill is None and window.stack.currentWidget() is editor
         assert len(editor.document.layers) == 2
         applied = editor.document
@@ -174,6 +175,7 @@ def test_remove_click_clears_an_isolated_sprite_without_codex(qt_app, tmp_path, 
         _wait_for_task(window)
         assert remove._apply.isEnabled()
         remove._apply.click()
+        _wait_for_task(window)
         expected = base.copy()
         expected.paste((0, 0, 0, 0), (20, 20, 40, 40))
         assert render(window.editor.document).tobytes() == expected.tobytes()

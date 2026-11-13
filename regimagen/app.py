@@ -1,5 +1,6 @@
 """Regimagen's main window."""
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -264,6 +265,7 @@ class Window(QMainWindow):
         self.active: Cell | None = None
         self.task: Task | None = None
         self.after_task: Callable[[], None] | None = None
+        self._editor_actions = deque()
         self.operation = ""
         self.closing = False
         self.export_message = ""
@@ -604,6 +606,8 @@ class Window(QMainWindow):
     def _open_layer_fill(self, *, remove=False):
         if self.task is not None or self.stack.currentWidget() is not self.editor:
             return
+        if self._after_editor_edits(lambda: self._open_layer_fill(remove=remove)):
+            return
         document, layer, selection = self.editor.document, self.editor.active_layer, self.editor.selection
         if document is None:
             return
@@ -732,7 +736,8 @@ class Window(QMainWindow):
             selection = session.editor.mask
         variant = session.variants[session.editor.selected_variant]
         self.editor.apply_fill(variant.document, variant.layer_id, selection)
-        self._close_layer_fill()
+        if not self.editor.after_edits(self._close_layer_fill):
+            self._close_layer_fill()
 
     def _close_layer_fill(self):
         if self.layer_fill is None or self.task is not None:
@@ -908,6 +913,12 @@ class Window(QMainWindow):
             self._import(Path(urls[0].toLocalFile()))
 
     def _confirm_replace(self, proceed):
+        def confirm():
+            if self._confirm_replace(proceed):
+                proceed()
+
+        if self._after_editor_edits(confirm):
+            return False
         if not self.editor.dirty:
             return True
         result = QMessageBox.question(
@@ -918,6 +929,16 @@ class Window(QMainWindow):
         if result == QMessageBox.StandardButton.Save:
             self._save_project(after_save=proceed)
         return result == QMessageBox.StandardButton.Discard
+
+    def _after_editor_edits(self, operation):
+        def ready():
+            if self.task is None:
+                operation()
+            else:
+                self._editor_actions.append((self.editor.document, operation))
+
+        return self.editor.after_edits(ready)
+
 
     def _new_document(self):
         if not self._can_open():
@@ -970,6 +991,8 @@ class Window(QMainWindow):
     def _import_layer(self):
         if not self._can_open() or self.stack.currentWidget() is not self.editor:
             return
+        if self._after_editor_edits(self._import_layer):
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Import image as a layer", "", "Images (*.png *.jpeg *.jpg *.webp)",
             options=QFileDialog.Option.DontUseNativeDialog,
@@ -981,7 +1004,7 @@ class Window(QMainWindow):
                 if image is not None and not self.closing:
                     self.editor.add_image(image, source.name)
 
-            self._launch("import_layer", lambda *_: load_source(source), show)
+            self._launch("import_layer", lambda *_: load_source(source).convert("RGBA"), show)
 
     def _save_destination(self, title, filename, formats):
         dialog = QFileDialog(self, title)
@@ -1005,8 +1028,12 @@ class Window(QMainWindow):
         return destination
 
     def _save_project(self, *, save_as=False, after_save=None):
+        if self.task is not None or self._after_editor_edits(
+            lambda: self._save_project(save_as=save_as, after_save=after_save),
+        ):
+            return
         document = self.editor.document
-        if document is None or self.task is not None:
+        if document is None:
             return
         destination = self.project_path
         if save_as or destination is None:
@@ -1036,8 +1063,12 @@ class Window(QMainWindow):
         self._launch("save_project", save, saved)
 
     def _export_document(self):
+        if not self._can_open() or self.stack.currentWidget() is not self.editor:
+            return
+        if self._after_editor_edits(self._export_document):
+            return
         document = self.editor.document
-        if document is None or not self._can_open() or self.stack.currentWidget() is not self.editor:
+        if document is None:
             return
         name = (self.project_path or Path(document.name)).stem
         destination = self._save_destination("Export image", f"{name}.png", {
@@ -1060,8 +1091,12 @@ class Window(QMainWindow):
         self._launch("export_document", save, saved, self.editor.set_message)
 
     def _reconstruct(self):
+        if not self._can_open() or self.stack.currentWidget() is not self.editor:
+            return
+        if self._after_editor_edits(self._reconstruct):
+            return
         document = self.editor.document
-        if document is None or not self._can_open() or self.stack.currentWidget() is not self.editor:
+        if document is None:
             return
         name = (self.project_path.stem + ".png") if self.project_path else document.name
         self.editor.set_message("Preparing reconstruction…")
@@ -1611,15 +1646,24 @@ class Window(QMainWindow):
         after_task, self.after_task = self.after_task, None
         self._refresh()
         if self.closing:
+            self._editor_actions.clear()
             self.closing = False
             self.close()
-        elif after_task is not None:
+            return
+        if after_task is not None:
             after_task()
+        while self.task is None and self._editor_actions:
+            document, operation = self._editor_actions.popleft()
+            if self.editor.document is document:
+                operation()
 
     def closeEvent(self, event):
         if self.task is not None:
             self.closing = True
             self.task.cancelled.set()
+            event.ignore()
+            return
+        if self._after_editor_edits(self.close):
             event.ignore()
             return
         if not self._confirm_replace(self.close):

@@ -1,5 +1,6 @@
 import time
 from pathlib import Path
+from threading import Event
 
 import pytest
 from PIL import Image
@@ -27,15 +28,18 @@ def wait_for(predicate, timeout=12):
 
 
 def idle(window):
-    wait_for(lambda: window.task is None)
+    wait_for(lambda: window.task is None and not window.editor.edits_pending)
 
 
-def gesture(view, *points):
+def gesture(view, *points, wait=True):
     positions = [view.mapFromScene(QPointF(*point)) for point in points]
     QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=positions[0])
     for position in positions[1:]:
         QTest.mouseMove(view.viewport(), position)
     QTest.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=positions[-1])
+    editor = view.parentWidget()
+    if wait and isinstance(editor, editor_module.Editor):
+        wait_for(lambda: not editor.edits_pending)
 
 
 def choose_tool(editor, name):
@@ -105,7 +109,7 @@ def test_open_edit_save_and_reopen_without_codex(window, tmp_path, monkeypatch):
     assert len(editor.document.layers) == 2
 
     expected = render(editor.document)
-    wait_for(lambda: editor._shown is not None and editor._shown[0] is editor.document)
+    wait_for(lambda: editor._preview.shown is not None and editor._preview.shown[0] is editor.document)
     display = editor.canvas._image.pixmap().toImage()
     assert display.pixelColor(24, 22).getRgb() == expected.getpixel((24, 22))
     export = tmp_path / "result.png"
@@ -146,6 +150,7 @@ def test_canvas_selection_masks_brush_and_transforms(window, monkeypatch):
     editor = window.editor
     assert editor.document.layers == () and render(editor.document).getbbox() is None
     action(editor, "Transparent layer").trigger()
+    idle(window)
     choose_tool(editor, "brush")
     editor.brush_size.setValue(12)
     before = editor.undo.count()
@@ -175,6 +180,7 @@ def test_canvas_selection_masks_brush_and_transforms(window, monkeypatch):
     assert editor.selection.getpixel((20, 24)) == 0 and editor.selection.getpixel((60, 40)) == 255
 
     action(editor, "Add layer mask").trigger()
+    idle(window)
     assert render(editor.document).getpixel((20, 24))[3] == 0
     editor.clear_button.click()
     editor.edit_mask.setChecked(True)
@@ -182,10 +188,12 @@ def test_canvas_selection_masks_brush_and_transforms(window, monkeypatch):
     gesture(editor.canvas, (20, 24))
     assert render(editor.document).getpixel((20, 24))[3] == 255
     action(editor, "Rotate 90° clockwise").trigger()
+    idle(window)
     assert editor.active_layer.image.size == editor.active_layer.mask.size == (80, 100)
     action(editor, "Flip horizontally").trigger()
     monkeypatch.setattr(editor_module, "dimensions", lambda *_, preserve_aspect: (40, 50) if preserve_aspect else None)
     action(editor, "Resize…").trigger()
+    idle(window)
     assert editor.active_layer.image.size == editor.active_layer.mask.size == (40, 50)
 
     choose_tool(editor, "rectangle")
@@ -206,7 +214,7 @@ def test_undo_crop_repaints_when_previous_preview_is_still_cached(window):
     original = desktop.Document.from_image(Image.new("RGB", (300, 180), "red"), "Crop")
     window._show_document(original)
     choose_tool(editor, "rectangle")
-    wait_for(lambda: editor._shown is not None and editor._shown[0] is original)
+    wait_for(lambda: editor._preview.shown is not None and editor._preview.shown[0] is original)
     gesture(editor.canvas, (40, 30), (160, 120))
     editor.crop_button.click()
     assert editor.document.size != original.size
@@ -224,7 +232,7 @@ def test_undo_and_redo_cancel_a_stroke_before_switching_layers(window):
     with_overlay = editor.document
     choose_tool(editor, "brush")
     editor.brush_size.setValue(12)
-    wait_for(lambda: editor._shown is not None and editor._shown[0] is with_overlay)
+    wait_for(lambda: editor._preview.shown is not None and editor._preview.shown[0] is with_overlay)
 
     canvas = editor.canvas
     point = canvas.mapFromScene(QPointF(20, 20))
@@ -240,6 +248,50 @@ def test_undo_and_redo_cancel_a_stroke_before_switching_layers(window):
         assert render(editor.document).getpixel((20, 20)) == (255, 0, 0, 255)
 
 
+def test_completed_strokes_are_ordered_before_undo_and_save(window, tmp_path, monkeypatch):
+    editor = window.editor
+    original = desktop.Document.from_image(Image.new("RGBA", (150, 100)), "Brush")
+    window._show_document(original)
+    choose_tool(editor, "brush")
+    editor.brush_size.setValue(10)
+    started, release = Event(), Event()
+    original_paint = editor_module.paint
+    calls = []
+
+    def paint(document, layer, points, **options):
+        calls.append(document)
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(5)
+        return original_paint(document, layer, points, **options)
+
+    destination = tmp_path / "strokes.regimagen"
+    exported = tmp_path / "strokes.png"
+    monkeypatch.setattr(editor_module, "paint", paint)
+    monkeypatch.setattr(window, "_save_destination", lambda title, *_: destination if title == "Save project" else exported)
+    try:
+        gesture(editor.canvas, (20, 20), (30, 20), wait=False)
+        wait_for(started.is_set)
+        editor.canvas.zoom(1.2)
+        gesture(editor.canvas, (55, 40), (65, 40), wait=False)
+        editor.undo_button.click()
+        window.save_as_action.trigger()
+        window.export_action.trigger()
+        assert editor.document is original and editor.edits_pending
+        assert not destination.exists() and not exported.exists()
+    finally:
+        release.set()
+    idle(window)
+    assert len(calls) == 2 and calls[0] is original and calls[1] is editor.document
+    assert editor.undo.canRedo() and not editor.dirty
+    saved = render(load_project(destination))
+    assert saved.getpixel((24, 20))[3] == 255 and saved.getpixel((60, 40))[3] == 0
+    with Image.open(exported) as output:
+        assert output.tobytes() == saved.tobytes()
+    editor.redo_button.click()
+    assert render(editor.document).getpixel((60, 40))[3] == 255
+
+
 def test_color_adjustments_preview_cancel_and_undo(window):
     editor = window.editor
     original = desktop.Document.from_image(Image.new("RGBA", (40, 30), (100, 45, 20, 200)), "Paint")
@@ -250,19 +302,22 @@ def test_color_adjustments_preview_cancel_and_undo(window):
         dialog = QApplication.activeModalWidget()
         assert isinstance(dialog, QDialog)
         brightness, contrast, saturation = dialog.findChildren(QSpinBox)
+        before = editor._preview._displayed
         brightness.setValue(20)
         contrast.setValue(10)
         saturation.setValue(-30)
-        previews.append(render(editor._draft).getpixel((12, 12)))
+        wait_for(lambda: editor._preview._displayed is not None and editor._preview._displayed is not before)
+        previews.append(editor.canvas._image.pixmap().toImage().pixelColor(12, 12).getRgb())
         dialog.accept() if accept else dialog.reject()
 
     QTimer.singleShot(0, lambda: adjust(False))
     action(editor, "Color adjustments…").trigger()
-    assert editor.document is original and editor._draft is None and not editor.undo.canUndo()
+    assert editor.document is original and editor._preview.draft is None and not editor.undo.canUndo()
     QTimer.singleShot(0, lambda: adjust(True))
     action(editor, "Color adjustments…").trigger()
     assert editor.active_layer.adjustments == (20, 10, -30)
-    assert previews[0] == previews[1] == render(editor.document).getpixel((12, 12))
+    assert previews[0] == previews[1]
+    assert max(abs(a - b) for a, b in zip(previews[0], render(editor.document).getpixel((12, 12)))) <= 3
     assert previews[0][:3] != (100, 45, 20) and previews[0][3] == 200
     editor.undo.undo()
     assert editor.document is original
@@ -316,6 +371,7 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
     assert render(variant.document).getpixel((22, 24)) == (255, 0, 0, 255)
     assert render(variant.document).getpixel((31, 23)) == (0, 128, 0, 255)
     fill._apply.click()
+    idle(window)
     assert editor.active_layer.id == active_id and len(editor.document.layers) == 3
     assert render(editor.document).tobytes() == render(variant.document).tobytes()
     editor.undo.undo()
@@ -339,6 +395,7 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
     fill._generate.click()
     idle(window)
     fill._apply.click()
+    idle(window)
     assert len(editor.document.layers) == 4 and editor.active_layer.coverage is not None
     assert render(editor.document).getpixel((22, 24)) == (0, 0, 0, 0)
     editor.undo.undo()

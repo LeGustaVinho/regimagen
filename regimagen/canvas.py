@@ -51,6 +51,16 @@ def combine_selection(mask: Image.Image | None, path: QPainterPath, size: tuple[
     return result
 
 
+def selection_overlay(mask: Image.Image, bounds: tuple[int, int, int, int]) -> QImage:
+    cropped = mask.crop(bounds)
+    cropped.thumbnail((4096, 4096), Image.Resampling.BILINEAR)
+    coverage = np.asarray(cropped)
+    overlay = np.empty((*coverage.shape, 4), dtype=np.uint8)
+    overlay[..., :3] = (117, 216, 190)
+    overlay[..., 3] = (coverage.astype(np.uint16) * 82 // 255).astype(np.uint8)
+    return qimage(overlay).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+
+
 class CanvasView(ImageView):
     stroke_started = Signal()
     stroke_finished = Signal(QPainterPath)
@@ -65,8 +75,10 @@ class CanvasView(ImageView):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._image = self.scene().addPixmap(QPixmap())
         self._image.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._image.setShapeMode(self._image.ShapeMode.BoundingRectShape)
         self._selection = self.scene().addPixmap(QPixmap())
         self._selection.setZValue(1)
+        self._selection.setShapeMode(self._selection.ShapeMode.BoundingRectShape)
         self._stroke_item = self.scene().addPath(QPainterPath())
         self._stroke_item.setZValue(2)
         self._outline = QPen(QColor("#d0fff2"), 1, Qt.PenStyle.DashLine)
@@ -75,6 +87,8 @@ class CanvasView(ImageView):
         self._checker = self._checker_texture()
         self._start: QPointF | None = None
         self._stroke: QPainterPath | None = None
+        self._stroke_timer = QTimer(self, singleShot=True, interval=16, timerType=Qt.TimerType.PreciseTimer)
+        self._stroke_timer.timeout.connect(self._show_stroke)
         self._pan_position = None
         self._pan_button = Qt.MouseButton.NoButton
         self._space = False
@@ -121,19 +135,18 @@ class CanvasView(ImageView):
         self._selection.setVisible(selection_visible)
 
     def set_selection(self, mask: Image.Image | None, bounds: tuple[int, int, int, int] | None):
+        self.set_selection_overlay(selection_overlay(mask, bounds) if bounds is not None else None, bounds)
+
+    def set_selection_overlay(self, overlay: QImage | None, bounds: tuple[int, int, int, int] | None):
         if bounds is None:
             self._selection.setPixmap(QPixmap())
             return
-        cropped = mask.crop(bounds)
-        width, height = cropped.size
-        cropped.thumbnail((4096, 4096), Image.Resampling.BILINEAR)
-        coverage = np.asarray(cropped)
-        overlay = np.empty((*coverage.shape, 4), dtype=np.uint8)
-        overlay[..., :3] = (117, 216, 190)
-        overlay[..., 3] = (coverage.astype(np.uint16) * 82 // 255).astype(np.uint8)
-        self._selection.setPixmap(QPixmap.fromImage(qimage(overlay)))
-        self._selection.setPos(bounds[0], bounds[1])
-        self._selection.setTransform(QTransform.fromScale(width / cropped.width, height / cropped.height))
+        left, top, right, bottom = bounds
+        self._selection.setPixmap(QPixmap.fromImage(overlay, Qt.ImageConversionFlag.NoOpaqueDetection))
+        self._selection.setPos(left, top)
+        self._selection.setTransform(QTransform.fromScale(
+            (right - left) / overlay.width(), (bottom - top) / overlay.height(),
+        ))
 
     def set_tool(self, tool: str):
         if self._tool != tool:
@@ -185,7 +198,9 @@ class CanvasView(ImageView):
 
     def _clear_gesture(self):
         self._start = self._stroke = None
-        self._stroke_item.setPath(QPainterPath())
+        self._stroke_timer.stop()
+        if not self._stroke_item.path().isEmpty():
+            self._stroke_item.setPath(QPainterPath())
 
     def cancel_gesture(self):
         if self._start is not None:
@@ -208,7 +223,7 @@ class CanvasView(ImageView):
         if self._drawing_enabled and button == Qt.MouseButton.LeftButton and self.sceneRect().contains(point):
             self.setFocus()
             self._start = point
-            self._stroke = QPainterPath(point)
+            self._stroke = QPainterPath(point) if self._tool != "move" else None
             if self._tool in SELECTION_TOOLS:
                 self._stroke_item.setPen(self._outline)
                 self.stroke_started.emit()
@@ -220,12 +235,18 @@ class CanvasView(ImageView):
         super().mousePressEvent(event)
 
     def _update_stroke(self, point: QPointF):
+        if self._stroke is None:
+            return
         if self._tool == "rectangle":
             self._stroke = QPainterPath()
             self._stroke.addRect(QRectF(self._start, point).normalized())
         else:
             self._stroke.lineTo(point)
-        if self._tool != "move":
+        if not self._stroke_timer.isActive():
+            self._stroke_timer.start()
+
+    def _show_stroke(self):
+        if self._stroke is not None:
             self._stroke_item.setPath(self._stroke)
 
     def mouseMoveEvent(self, event):
@@ -257,9 +278,9 @@ class CanvasView(ImageView):
             point = self._scene_point(event.position())
             self._update_stroke(point)
             path = self._stroke
-            path.closeSubpath()
             self._clear_gesture()
             if self._tool in SELECTION_TOOLS:
+                path.closeSubpath()
                 if path.elementCount() > 3:
                     self.stroke_finished.emit(path)
             else:
