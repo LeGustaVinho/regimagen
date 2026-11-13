@@ -1,6 +1,7 @@
 from dataclasses import replace
 from threading import Event
 
+import numpy as np
 import pytest
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, Qt
@@ -10,9 +11,12 @@ from PySide6.QtWidgets import QApplication
 
 import regimagen.editor as editor_module
 import regimagen.editor_preview as preview_module
+from regimagen.codex import Cancelled
 from regimagen.document import Document, Layer, render
 from regimagen.editor import Editor
-from regimagen.editor_preview import PreviewTiles, interactive_preview, interactive_region
+from regimagen.editor_preview import PreviewRegion, PreviewTiles, exact_preview, interactive_preview, interactive_region
+from regimagen.geometry import Rect
+from regimagen.viewer import qimage
 
 
 def wait_for(condition):
@@ -62,6 +66,27 @@ def test_preview_reuses_position_independent_tiles_and_preserves_fill_alpha(qt_a
     interactive_preview(document, region, limited, available)
     assert 0 < limited.bytes <= limited.max_bytes
     assert interactive_region(document.bounds, 0.26).step == 4
+
+
+def test_exact_preview_matches_serial_stripes_with_transparency(qt_app, monkeypatch):
+    size = (2160, 1190)
+    base = Image.new("RGBA", size, (250, 160, 20, 210))
+    base.paste((20, 150, 210, 255), (23, 850, 1900, 923))
+    pixels = Image.new("RGBA", (2000, 1050), (50, 90, 120, 240))
+    pixels.paste((80, 32, 52, 0), (30, 600, 1540, 960))
+    coverage = Image.new("L", pixels.size, 255)
+    coverage.paste(130, (0, 290, 1650, 980))
+    document = Document("Stripes", *size, (Layer("Base", base), Layer("Fill", pixels, -9, 15, coverage=coverage)))
+    region = PreviewRegion(Rect(7, 19, 2131, 1176), (711, 395))
+    monkeypatch.setattr(preview_module, "process_cpu_count", lambda: 1)
+    serial = exact_preview(document, region, lambda: False)
+    monkeypatch.setattr(preview_module, "process_cpu_count", lambda: 4)
+    assert exact_preview(document, region, lambda: False) == serial
+    area = region.area
+    native = PreviewRegion(area, (area.width, area.height))
+    assert exact_preview(document, native, lambda: False) == qimage(np.asarray(render(document, area)))
+    with pytest.raises(Cancelled):
+        exact_preview(document, region, lambda: True)
 
 
 def test_drag_displays_in_flight_frames_and_cancels_old_gestures(editor, monkeypatch):

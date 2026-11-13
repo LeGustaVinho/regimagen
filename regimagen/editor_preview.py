@@ -2,7 +2,9 @@
 
 import math
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from os import process_cpu_count
 from time import monotonic
 from weakref import ref
 
@@ -19,6 +21,7 @@ from .viewer import qimage
 
 PREVIEW_PIXELS = 1_000_000
 PREVIEW_CACHE_BYTES = 128 * 1024 * 1024
+_EXACT_STRIPE_PIXELS = 2_000_000
 _FORMAT = QImage.Format.Format_ARGB32_Premultiplied
 _MODE = QPainter.CompositionMode
 
@@ -41,15 +44,19 @@ def interactive_region(area: Rect, scale: float) -> PreviewRegion:
 
 def exact_preview(document: Document, region: PreviewRegion, cancelled):
     area, size = region.area, region.size
-    if (area.width, area.height) == size:
+    unscaled = (area.width, area.height) == size
+    if unscaled and math.prod(size) <= _EXACT_STRIPE_PIXELS:
         return qimage(np.asarray(render(document, area, cancelled=cancelled)))
 
     # Preserve the Lanczos support at the edges of each resampled stripe.
     ratio = area.height / size[1]
-    padding = math.ceil(3 * max(1, ratio))
-    step = max(1, int(2_000_000 / (area.width * ratio)))
-    result = Image.new("RGBA", size)
-    for top in range(0, size[1], step):
+    padding = 0 if unscaled else math.ceil(3 * max(1, ratio))
+    step = max(1, int(_EXACT_STRIPE_PIXELS / (area.width * ratio)))
+    tops = range(0, size[1], step)
+
+    def render_stripe(top):
+        if cancelled():
+            raise Cancelled("Preview superseded.")
         bottom = min(top + step, size[1])
         first = area.top + top * ratio
         last = area.top + bottom * ratio
@@ -60,11 +67,27 @@ def exact_preview(document: Document, region: PreviewRegion, cancelled):
         pixels = render(document, stripe, cancelled=cancelled)
         if cancelled():
             raise Cancelled("Preview superseded.")
-        scaled = pixels.resize(
+        if unscaled:
+            return top, pixels
+        return top, pixels.resize(
             (size[0], bottom - top), Image.Resampling.LANCZOS,
             box=(0, first - stripe.top, area.width, min(stripe.height, last - stripe.top)),
         )
-        result.paste(scaled, (0, top))
+
+    result = Image.new("RGBA", size)
+
+    def paste_stripes(stripes):
+        for top, pixels in stripes:
+            if cancelled():
+                raise Cancelled("Preview superseded.")
+            result.paste(pixels, (0, top))
+
+    workers = min(5, len(tops), process_cpu_count() or 1)
+    if workers == 1:
+        paste_stripes(map(render_stripe, tops))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            paste_stripes(pool.map(render_stripe, tops, buffersize=workers))
     return qimage(np.asarray(result))
 
 

@@ -266,15 +266,32 @@ def _adjust(image: Image.Image, values: tuple[int, int, int]) -> Image.Image:
 
 
 def _replace_pixels(lower: Image.Image, upper: Image.Image, weight: Image.Image) -> Image.Image:
+    histogram = weight.histogram()
+    if histogram[0] + histogram[255] == weight.width * weight.height:
+        result = Image.composite(upper, lower, weight)
+        alpha = result.getchannel("A")
+        if alpha.getextrema()[0] == 0:
+            result.paste((0, 0, 0, 0), (0, 0, *result.size), alpha.point([255] + [0] * 255))
+        return result
+
     low, high = np.asarray(lower), np.asarray(upper)
-    mix = np.asarray(weight, dtype=np.float32)[..., None] / 255
-    low_alpha = low[..., 3:] * (1 - mix)
-    high_alpha = high[..., 3:] * mix
+    mix = np.asarray(weight, dtype=np.float32) / 255
+    low_alpha = low[..., 3] * (1 - mix)
+    high_alpha = high[..., 3] * mix
     alpha = low_alpha + high_alpha
-    color = low[..., :3] * low_alpha + high[..., :3] * high_alpha
-    np.divide(color, alpha, out=color, where=alpha > 0)
-    result = np.rint(np.concatenate((color, alpha), axis=2)).astype(np.uint8)
-    result[result[..., 3] == 0] = 0
+    # Dividing by infinity clears RGB wherever the rounded alpha is zero.
+    divisor = np.where(alpha > 0.5, alpha, np.float32(np.inf))
+    color = np.empty_like(alpha)
+    contribution = np.empty_like(alpha)
+    result = np.empty_like(low)
+    for channel in range(3):
+        np.multiply(low[..., channel], low_alpha, out=color)
+        np.multiply(high[..., channel], high_alpha, out=contribution)
+        color += contribution
+        color /= divisor
+        np.rint(color, out=color)
+        result[..., channel] = color
+    result[..., 3] = np.rint(alpha)
     return Image.fromarray(result)
 
 
@@ -287,12 +304,16 @@ def _render_band(document: Document, area: Rect) -> Image.Image:
         region = box(overlap.relative_to(layer.bounds))
         target = overlap.relative_to(area)
         pixels = _adjust(layer.image.crop(region), layer.adjustments)
+        origin = target.left, target.top
+        if layer.coverage is None and layer.mask is None and layer.opacity == 100:
+            result.alpha_composite(pixels, origin)
+            continue
+
         weight = layer.coverage.crop(region) if layer.coverage is not None else pixels.getchannel("A")
         if layer.mask is not None:
             weight = ImageChops.multiply(weight, layer.mask.crop(region))
         if layer.opacity != 100:
             weight = weight.point([round(value * layer.opacity / 100) for value in range(256)])
-        origin = target.left, target.top
         if layer.coverage is None:
             pixels.putalpha(weight)
             result.alpha_composite(pixels, origin)

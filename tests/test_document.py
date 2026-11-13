@@ -1,11 +1,12 @@
 from dataclasses import replace
 from zipfile import ZipFile
 
+import numpy as np
 import pytest
 from PIL import Image
 
 from regimagen.codex import Cancelled
-from regimagen.document import RASTER_TILE_SIZE, Document, Layer, Raster, export_document, paint, render
+from regimagen.document import RASTER_TILE_SIZE, Document, Layer, Raster, _replace_pixels, export_document, paint, render
 from regimagen.files import SRGB_BYTES
 from regimagen.geometry import Rect
 from regimagen.project import load_project, save_project
@@ -64,6 +65,32 @@ def test_fill_opacity_interpolates_alpha_and_jpeg_uses_white_matte(tmp_path):
     with Image.open(output) as image:
         assert image.mode == "RGB"
         assert all(channel >= 250 for channel in image.getpixel((29, 8)))
+
+
+@pytest.mark.parametrize("binary", [False, True])
+def test_fill_replacement_keeps_straight_alpha_and_rounding(binary):
+    rng = np.random.default_rng(26)
+    low, high = rng.integers(0, 256, size=(2, 48, 67, 4), dtype=np.uint8)
+    low[0, :4, 3] = 0
+    high[0, :4, 3] = (90, 0, 1, 127)
+    weight = rng.integers(0, 256, size=low.shape[:2], dtype=np.uint8)
+    if binary:
+        weight = (weight >= 128).astype(np.uint8) * 255
+        weight[0, :4] = (0, 255, 255, 255)
+    else:
+        weight[0, :4] = (0, 255, 1, 254)
+
+    mix = weight.astype(np.float32)[..., None] / 255
+    low_alpha = low[..., 3:] * (1 - mix)
+    high_alpha = high[..., 3:] * mix
+    alpha = low_alpha + high_alpha
+    rgb = low[..., :3] * low_alpha + high[..., :3] * high_alpha
+    np.divide(rgb, alpha, out=rgb, where=alpha > 0)
+    expected = np.rint(np.concatenate((rgb, alpha), axis=2)).astype(np.uint8)
+    expected[expected[..., 3] == 0] = 0
+
+    actual = _replace_pixels(Image.fromarray(low), Image.fromarray(high), Image.fromarray(weight))
+    assert actual.tobytes() == expected.tobytes()
 
 
 def test_brush_history_shares_pixels_and_saves_edited_tiles(tmp_path, monkeypatch):
