@@ -216,7 +216,14 @@ class Editor(QWidget):
         content.addLayout(tools)
 
         work = QHBoxLayout()
-        work.addWidget(self.canvas, 1)
+        canvas_column = QVBoxLayout()
+        canvas_column.addWidget(self.canvas, 1)
+        self.tool_hint = QLabel()
+        self.tool_hint.setObjectName("muted")
+        self.tool_hint.setTextFormat(Qt.TextFormat.PlainText)
+        self.tool_hint.setWordWrap(True)
+        canvas_column.addWidget(self.tool_hint)
+        work.addLayout(canvas_column, 1)
         work.addWidget(self._layer_panel())
         content.addLayout(work, 1)
         self.message = QLabel()
@@ -555,9 +562,23 @@ class Editor(QWidget):
         editing_mask = self.edit_mask.isChecked()
         painting = tool in ("brush", "eraser")
         can_paint = editable and (layer.mask is not None if editing_mask else layer.coverage is None)
-        self.canvas.set_drawing_enabled(
-            not self._busy and (tool in SELECTION_TOOLS or (editable and tool == "move") or (painting and can_paint)),
-        )
+        can_draw = tool in SELECTION_TOOLS or (editable and tool == "move") or (painting and can_paint)
+        self.canvas.set_drawing_enabled(not self._busy and can_draw)
+        hint = ""
+        if self.document is not None and not self._busy and not can_draw and (painting or tool == "move"):
+            if layer is None:
+                action = "Select a layer in Layers" if self.document.layers else "Add a layer"
+                hint = f"{action} to use {self.tool.currentText()}."
+            elif not layer.visible:
+                hint = f"Turn on visibility for “{layer.name}” in Layers."
+            elif layer.locked:
+                hint = f"Turn off Lock layer to edit “{layer.name}”."
+            elif layer.mask is not None:
+                hint = "Turn on Paint mask or select a raster layer to paint pixels."
+            else:
+                hint = "Add a layer mask or select a raster layer to paint pixels."
+        self.tool_hint.setText(hint)
+        self.tool_hint.setVisible(bool(hint))
         self.selection_mode.setVisible(tool in SELECTION_TOOLS)
         self.clear_button.setEnabled(self.selection is not None)
         self.crop_button.setEnabled(self.selection is not None and self.selection.getbbox() != box(self.document.bounds))

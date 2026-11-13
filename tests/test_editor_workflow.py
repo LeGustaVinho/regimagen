@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, Q
 import regimagen.app as desktop
 import regimagen.editor as editor_module
 import regimagen.jobs as jobs
-from regimagen.codex import Cancelled
+from regimagen.codex import AuthRequired, Cancelled, QuotaPaused
 from regimagen.document import render
 from regimagen.fill import FillCandidate
 from regimagen.geometry import FRAME, Cell, Grid
@@ -290,6 +290,10 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
         if prompt == "Cancel":
             assert cancelled.wait(5)
             raise Cancelled("Generation canceled.")
+        if prompt == "Sign in":
+            raise AuthRequired("Sign in required.")
+        if prompt == "Quota":
+            raise QuotaPaused(2_000_000_000)
         side = max(base.size)
         return FillCandidate(Image.new("RGBA", (side, side)), {
             "crop": (0, 0, side, side), "shift": (0, 0), "color": (0, 0, 0), "feather": 1,
@@ -318,10 +322,16 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
     assert render(variant.document).getpixel((22, 24)) == (255, 0, 0, 255)
     assert render(variant.document).getpixel((31, 23)) == (0, 128, 0, 255)
     fill._apply.click()
+    idle(window)
+    assert window.task_status.text() == "Applied to the active layer “Active”. Undo with Ctrl+Z."
     assert editor.active_layer.id == active_id and len(editor.document.layers) == 3
     assert render(editor.document).tobytes() == render(variant.document).tobytes()
-    editor.undo.undo()
+    window.activateWindow()
+    QApplication.processEvents()
+    assert editor.canvas.hasFocus()
+    QTest.keyClick(editor.canvas, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
     assert editor.document is before
+    assert not window.task_status.text()
 
     editor.fill_button.click()
     idle(window)
@@ -329,9 +339,20 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
     fill._alpha.setChecked(True)
     fill._prompt.setText("Cancel")
     fill._generate.click()
+    assert window.task_status.text() == "Generating variation…"
     fill._cancel.click()
+    assert window.task_status.text() == "Cancelling…" and not fill._cancel.isEnabled()
     idle(window)
+    assert window.task_status.text() == "Generation canceled." and window.task_progress.isHidden()
     assert fill.selected_variant is None and editor.document is before
+    fill._prompt.setText("Sign in")
+    fill._generate.click()
+    idle(window)
+    assert "Run codex login" in window.task_status.text()
+    fill._prompt.setText("Quota")
+    fill._generate.click()
+    idle(window)
+    assert window.task_status.text().startswith("Codex usage limit reached. Try again after ")
     fill._discard.click()
     assert window.stack.currentWidget() is editor and editor.document is before
     editor.fill_button.click()
@@ -341,6 +362,8 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
     fill._generate.click()
     idle(window)
     fill._apply.click()
+    idle(window)
+    assert window.task_status.text() == "Applied to a new layer “Generative Fill”. Undo with Ctrl+Z."
     assert len(editor.document.layers) == 4 and editor.active_layer.coverage is not None
     assert render(editor.document).getpixel((22, 24)) == (0, 0, 0, 0)
     editor.undo.undo()
@@ -630,3 +653,26 @@ def test_scale_batch_reports_stage_and_resumes_in_the_same_folder(window, tmp_pa
     assert sorted(path.name for path in folder.glob("*.png")) == ["Base-2x.png", "Base-3x.png", "Base-4x.png"]
     if conflict_scale is not None:
         assert preserved_file.read_bytes() == edited
+
+
+def test_canvas_hint_tracks_missing_hidden_and_locked_layers(window):
+    window._show_document(desktop.Document("Untitled", 24, 24))
+    editor = window.editor
+    choose_tool(editor, "brush")
+    assert editor.tool_hint.text() == "Add a layer to use Brush." and editor.tool_hint.isVisible()
+    editor.add_image(Image.new("RGBA", (24, 24)), "Pixels")
+    assert editor.tool_hint.isHidden()
+    editor.layers.setCurrentRow(-1)
+    assert "Select a layer" in editor.tool_hint.text()
+    editor.layers.setCurrentRow(0)
+    editor.layers.currentItem().setCheckState(Qt.CheckState.Unchecked)
+    assert "Turn on visibility" in editor.tool_hint.text()
+    editor.layers.currentItem().setCheckState(Qt.CheckState.Checked)
+    editor.locked.setChecked(True)
+    assert "Turn off Lock layer" in editor.tool_hint.text()
+    choose_tool(editor, "pan")
+    assert editor.tool_hint.isHidden()
+    choose_tool(editor, "eraser")
+    assert "Turn off Lock layer" in editor.tool_hint.text()
+    editor.locked.setChecked(False)
+    assert editor.tool_hint.isHidden()

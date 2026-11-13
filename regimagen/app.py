@@ -743,11 +743,7 @@ class Window(QMainWindow):
             return detect_removal(image, guide, executable(), cancelled=cancel), True
 
         def show(result):
-            if self.closing:
-                return
-            if result is None:
-                editor.set_message("Object detection canceled.")
-            else:
+            if not self.closing:
                 targets, detailed = result
                 editor.set_targets(targets, detailed=detailed)
 
@@ -774,15 +770,12 @@ class Window(QMainWindow):
 
         self._launch("generate_remove", generate, self._append_layer_variant, message="Removing selected area…")
 
-    def _append_layer_variant(self, variant: LayeredVariant | None):
+    def _append_layer_variant(self, variant: LayeredVariant):
         session = self.layer_fill
         if session is None or self.closing:
             return
-        if variant is None:
-            session.editor.set_message("Generation canceled.")
-        else:
-            session.variants.append(variant)
-            session.editor.add_variant(variant.preview)
+        session.variants.append(variant)
+        session.editor.add_variant(variant.preview)
 
     def _apply_layer_fill(self):
         session = self.layer_fill
@@ -798,8 +791,12 @@ class Window(QMainWindow):
         else:
             selection = session.editor.mask
         variant = session.variants[session.editor.selected_variant]
+        layer = variant.document.layer(variant.layer_id)
+        destination = "the active layer" if session.document.layer(variant.layer_id) is not None else "a new layer"
         self.editor.apply_fill(variant.document, variant.layer_id, selection)
         self._close_layer_fill()
+        self.editor.canvas.setFocus()
+        self._set_feedback(f"Applied to {destination} “{layer.name}”. Undo with Ctrl+Z.")
 
     def _close_layer_fill(self):
         if self.layer_fill is None or self.task is not None:
@@ -811,12 +808,9 @@ class Window(QMainWindow):
         editor.deleteLater()
         self._refresh()
 
-    def _append_fill_variant(self, result: tuple[FillCandidate, FillPreview] | None, *, already_applied=False):
+    def _append_fill_variant(self, result: tuple[FillCandidate, FillPreview], *, already_applied=False):
         session = self.fill
         if session is None or self.closing:
-            return
-        if result is None:
-            session.editor.set_message("Generation canceled.")
             return
         session.variants.append(result)
         session.editor.add_variant(result[1], already_applied=already_applied)
@@ -864,8 +858,8 @@ class Window(QMainWindow):
                 raise Cancelled("Generation canceled.")
             return result
 
-        self._launch("generate_fill", generate, self._append_fill_variant if layered is None else self._append_layer_variant,
-                     message="Generating variation…")
+        append = self._append_fill_variant if layered is None else self._append_layer_variant
+        self._launch("generate_fill", generate, append, message="Generating variation…")
 
     def _cancel_fill(self):
         if self.task is not None and self.operation in ("generate_fill", "detect_remove", "generate_remove"):
@@ -898,6 +892,7 @@ class Window(QMainWindow):
             if loaded is not None and not self.closing:
                 self._close_fill()
                 self._show_source(loaded)
+                self._set_feedback(f"Saved image version {self.source.name}. Find it in Recent.")
 
         self._launch("apply_fill", save, show, message="Saving image version…")
 
@@ -1339,12 +1334,14 @@ class Window(QMainWindow):
             self.setWindowTitle("Reconstruction — Regimagen")
             self.source_label.setText(f"{number(self.original.width())} × {number(self.original.height())} px")
         if session is not None:
+            cancelling = busy and self.task.cancelled.is_set()
             if isinstance(session.editor, RemoveEditor):
                 session.editor.set_busy(
                     busy, generating=self.operation == "generate_remove", detecting=self.operation == "detect_remove",
+                    cancelling=cancelling,
                 )
             else:
-                session.editor.set_busy(busy, generating=self.operation == "generate_fill")
+                session.editor.set_busy(busy, generating=self.operation == "generate_fill", cancelling=cancelling)
             return
         if not comparing:
             return

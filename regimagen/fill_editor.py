@@ -211,9 +211,10 @@ class FillEditor(QWidget):
     def can_apply(self) -> bool:
         return self.selected_variant is not None and not self._chooser.currentData()
 
-    def set_busy(self, busy: bool, *, generating: bool = False):
+    def set_busy(self, busy: bool, *, generating: bool = False, cancelling: bool = False):
         self._busy = busy
         self._generating = busy and generating
+        self._cancel.setEnabled(not cancelling)
         self._canvas.set_drawing_enabled(not busy)
         self._refresh()
 
@@ -287,6 +288,12 @@ class FillEditor(QWidget):
             painter.end()
         self._canvas.set_image(display, selection_visible=not showing_after)
 
+    def _variant_message(self, index: int) -> str:
+        warning = self._variants[index].warning
+        if not self.can_apply:
+            return f"This variation is already applied. {warning}".strip()
+        return warning or "Variation ready. Use Before and After to compare."
+
     def _refresh(self):
         selected = self._bounds is not None
         can_generate = self.can_generate
@@ -315,7 +322,6 @@ class FillEditor(QWidget):
             elif not can_generate:
                 message = TRANSPARENT_SELECTION
             elif index is not None:
-                warning = self._variants[index].warning
-                message = warning if self.can_apply else f"This variation is already applied. {warning}".strip()
+                message = self._variant_message(index)
         self._status.setText(message)
-        self._status.setVisible(bool(message))
+        self._status.setVisible(bool(message) and not self._busy)

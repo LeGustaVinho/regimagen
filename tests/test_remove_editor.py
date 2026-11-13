@@ -77,7 +77,7 @@ def test_remove_review_keeps_lasso_and_allows_manual_correction(qt_app):
     assert semantic.count() == 1
     editor.set_busy(True, detecting=True)
     assert editor._cancel.isVisible()
-    assert editor._status.text() == "Detecting objects…"
+    assert editor._status.isHidden()
     editor.set_targets((RemovalTarget("Confirmed object", object_mask, (12, 12)),), detailed=True)
     editor.set_busy(False)
     assert editor.removal_inputs()[1].getpixel((30, 25)) == 0

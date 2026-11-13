@@ -101,6 +101,7 @@ def test_remove_reviews_targets_then_applies_and_saves_a_replacement_layer(qt_ap
 
         _, footprint, _ = remove.removal_inputs()
         remove._apply.click()
+        assert window.task_status.text() == "Applied to a new layer “Generative Remove”. Undo with Ctrl+Z."
         assert window.layer_fill is None and window.stack.currentWidget() is editor
         assert len(editor.document.layers) == 2
         applied = editor.document

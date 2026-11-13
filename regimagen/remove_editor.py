@@ -115,7 +115,6 @@ class RemoveEditor(FillEditor):
         self._detection_points: tuple[tuple[int, int], ...] = ()
         self._click_start: QPointF | None = None
         self._detailed = False
-        self._detecting = False
         self._has_extension = False
         self._prompt.hide()
         self._alpha.hide()
@@ -389,9 +388,8 @@ class RemoveEditor(FillEditor):
         self._target_outline.setVisible(visible and self._detailed)
         self._click_marker.setVisible(self._original_mask is None and bool(self._detection_points))
 
-    def set_busy(self, busy: bool, *, generating: bool = False, detecting: bool = False):
-        self._detecting = busy and detecting
-        super().set_busy(busy, generating=generating or detecting)
+    def set_busy(self, busy: bool, *, generating: bool = False, detecting: bool = False, cancelling: bool = False):
+        super().set_busy(busy, generating=generating or detecting, cancelling=cancelling)
 
     def _refresh(self):
         super()._refresh()
@@ -421,16 +419,11 @@ class RemoveEditor(FillEditor):
         self._canvas.set_drawing_enabled(not self._busy and (not reviewing or self._detailed))
         self._generate.setVisible(reviewing)
         self._generate.setText("Generate another" if self._variants else "Remove")
-        if self._generating:
-            self._status.setText("Detecting objects…" if self._detecting or not reviewing else "Reconstructing the background…")
-            self._status.show()
-            return
-        if self._message:
+        if self._busy or self._message:
             return
         variant = self.selected_variant
         if variant is not None:
-            warning = self._variants[variant].warning
-            message = warning if self.can_apply else f"This variation is already applied. {warning}".strip()
+            message = self._variant_message(variant)
         elif reviewing:
             if not self.can_generate:
                 message = "Choose at least one object or add an area to remove."

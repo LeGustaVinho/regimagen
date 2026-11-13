@@ -99,6 +99,7 @@ def test_desktop_applies_then_reopens_and_reduces_fill_without_generation(tmp_pa
 
         editor._apply.click()
         wait_for_task(window)
+        assert "Saved image version" in window.task_status.text() and "Recent" in window.task_status.text()
         first = window.source
         first_fill = store.get_fill(first)
         assert first_fill.base.id == base.id
