@@ -1,10 +1,11 @@
 import time
 from pathlib import Path
+from threading import Event
 
 import pytest
 from PIL import Image
 from PySide6.QtCore import QPointF, QSettings, QTimer, Qt
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QSpinBox
 
@@ -382,3 +383,97 @@ def test_reconstruction_resumes_snapshot_and_opens_result(window, tmp_path):
     assert window.stack.currentWidget() is editor
     assert editor.document.id != document_id and editor.document.size == job.layout.size
     assert editor.active_layer.image.getpixel((100, 20)) == (0, 0, 128, 255)
+
+
+def test_task_feedback_for_open_save_and_failed_export(window, tmp_path, monkeypatch):
+    project = tmp_path / "Project.regimagen"
+    document = desktop.Document.from_image(Image.new("RGBA", (24, 24)), "Base.png")
+    desktop.save_project(document, project)
+    release = Event()
+
+    def slow_load(path, *, cancelled):
+        assert release.wait(5)
+        return load_project(path, cancelled=cancelled)
+
+    monkeypatch.setattr(desktop, "load_project", slow_load)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_, **_options: (str(project), ""))
+    window.open_action.trigger()
+    try:
+        assert window.task_status.isVisible() and window.task_status.text() == "Opening project…"
+        assert window.task_progress.isVisible() and window.task_progress.maximum() == 0
+        assert not window.empty_button.isEnabled()
+    finally:
+        release.set()
+    idle(window)
+    assert window.task_status.text() == "Opened Project.regimagen" and window.task_progress.isHidden()
+    window.save_action.trigger()
+    assert window.task_status.text() == "Saving project…"
+    idle(window)
+    assert window.task_status.text() == "Saved Project.regimagen" and window.open_folder.isVisible()
+    opened = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(Path(url.toLocalFile())) or True)
+    window.open_folder.click()
+    assert opened == [tmp_path]
+
+    window.editor.reconstruct_button.click()
+    idle(window)
+    window.generate.click()
+    idle(window)
+    assert window.export.isEnabled()
+    destination = tmp_path / "reconstruction.png"
+    monkeypatch.setattr(QFileDialog, "exec", lambda _dialog: 1)
+    monkeypatch.setattr(QFileDialog, "selectedFiles", lambda _dialog: [str(destination)])
+    release.clear()
+    export = desktop.export_png
+
+    def broken_export(*_args, progress, **_kwargs):
+        progress(3, 5)
+        assert release.wait(5)
+        raise PermissionError("The destination is read-only.")
+
+    monkeypatch.setattr(desktop, "export_png", broken_export)
+    window.export.click()
+    try:
+        wait_for(lambda: window.task_status.text() == "Exporting PNG · 60%")
+        assert window.task_progress.value() == 3 and window.task_progress.maximum() == 5
+        assert window.status.text() == "4/4 ready"
+    finally:
+        release.set()
+    idle(window)
+    assert "Export failed." in window.task_status.text() and "choose another folder" in window.task_status.text()
+    assert window.task_progress.isHidden() and window.open_folder.isHidden()
+    assert window.export.isEnabled() and not destination.exists()
+    release.clear()
+
+    def canceled_export(*_args, progress, cancelled, **_kwargs):
+        progress(2, 5)
+        assert release.wait(5)
+        assert cancelled()
+        raise Cancelled("Export canceled.")
+
+    monkeypatch.setattr(desktop, "export_png", canceled_export)
+    window.export.click()
+    try:
+        wait_for(lambda: window.task_status.text() == "Exporting PNG · 40%")
+        assert window.cancel_task.isEnabled() and window.cancel_task.isVisible()
+        window.cancel_task.click()
+        assert window.task_status.text() == "Cancelling…" and not window.cancel_task.isEnabled()
+    finally:
+        release.set()
+    idle(window)
+    assert window.task_status.text() == "Export canceled."
+    assert window.cancel_task.isHidden() and not destination.exists()
+
+    monkeypatch.setattr(desktop, "export_png", export)
+    window.export.click()
+    idle(window)
+    assert window.task_status.text() == "Exported reconstruction.png" and window.open_folder.isVisible()
+    assert destination.is_file()
+
+    destination = next(iter(window.store.snapshot(window.job).current_artifacts.values()))
+    saved_tile = destination.read_bytes()
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "information", lambda _parent, _title, message: warnings.append(message))
+    window.export.click()
+    assert window.task is None and warnings and "managed files" in warnings[0]
+    assert destination.read_bytes() == saved_tile
