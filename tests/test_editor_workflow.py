@@ -572,3 +572,61 @@ def test_preview_recovery_keeps_the_requested_region_when_the_quota_time_is_unav
     window._show_grid(window.grid, window.job)
     assert "Codex has reached its usage limit." in window.status.text()
     assert window.retry_task.isHidden()
+
+
+@pytest.mark.parametrize(("chained", "conflict_scale"), [(False, None), (False, 2), (True, 2), (True, 3)])
+def test_scale_batch_reports_stage_and_resumes_in_the_same_folder(window, tmp_path, monkeypatch, chained, conflict_scale):
+    document = desktop.Document.from_image(Image.new("RGBA", (24, 24)), "Base.png")
+    window._show_document(document)
+    window.editor.reconstruct_button.click()
+    idle(window)
+    window.settings.setValue("scales", "2, 3, 4")
+    window.settings.setValue("chainedScales", chained)
+    monkeypatch.setattr(QDialog, "exec", lambda _dialog: 1)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *_, **_options: str(tmp_path))
+    run_tiles = jobs.run_tiles
+    pause_once = Event()
+
+    def generate(store, job, cells, executable, *, pause, **kwargs):
+        if job.scale == 3 and not pause_once.is_set():
+            assert pause.wait(5)
+            pause_once.set()
+        return run_tiles(store, job, cells, executable, pause=pause, **kwargs)
+
+    monkeypatch.setattr(jobs, "run_tiles", generate)
+    export_png = jobs.export_png
+    exported_scales = []
+
+    def export(layout, *args, **kwargs):
+        exported_scales.append(layout.scale)
+        return export_png(layout, *args, **kwargs)
+
+    monkeypatch.setattr(jobs, "export_png", export)
+    window.batch.click()
+    wait_for(lambda: window.task_status.text().startswith("Scale 2/3 · 3×"))
+    window.generate.click()
+    assert window.task_status.text().startswith("Pausing") and not window.generate.isEnabled()
+    idle(window)
+    assert "Scale batch paused." in window.task_status.text() and "Exported 1/3 PNGs." in window.task_status.text()
+    folder = window.output_folder
+    assert folder is not None and (folder / "Base-2x.png").is_file()
+    assert window.generate.text() == "Resume batch" and window.generate.isEnabled()
+    if conflict_scale is not None:
+        conflicting_file = folder / f"Base-{conflict_scale}x.png"
+        Image.new("RGB", (24 * conflict_scale, 24 * conflict_scale), "blue").save(conflicting_file)
+        edited = conflicting_file.read_bytes()
+        window.generate.click()
+        idle(window)
+        assert conflicting_file.read_bytes() == edited
+        assert conflicting_file.name in window.task_status.text() and "Move or rename" in window.task_status.text()
+        assert window.output_folder == folder and window.open_folder.isVisible()
+        assert window.generate.text() == "Resume batch" and window.generate.isEnabled()
+        preserved_file = conflicting_file.rename(conflicting_file.with_suffix(".edited"))
+    window.generate.click()
+    idle(window)
+    assert window.task_status.text() == "Scale batch complete. Exported 3/3 PNGs."
+    assert window.output_folder == folder
+    assert exported_scales == ([2, 2, 3, 4] if conflict_scale == 2 and not chained else [2, 3, 4])
+    assert sorted(path.name for path in folder.glob("*.png")) == ["Base-2x.png", "Base-3x.png", "Base-4x.png"]
+    if conflict_scale is not None:
+        assert preserved_file.read_bytes() == edited

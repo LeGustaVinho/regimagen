@@ -6,7 +6,7 @@ from datetime import datetime
 from hashlib import file_digest
 from pathlib import Path
 from shutil import copyfileobj
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 from threading import Event
 
 import numpy as np
@@ -104,6 +104,19 @@ class LayerFillSession:
     editor: FillEditor
     target: ActiveFillTarget | None
     variants: list[LayeredVariant] = field(default_factory=list)
+
+
+@dataclass
+class ScaleBatch:
+    source: Source
+    layouts: tuple[Layout, ...]
+    parent: Path
+    prompt: str
+    job: Job | None
+    grid: Grid
+    folder: Path | None = None
+    published: dict[int, tuple[str, str]] = field(default_factory=dict)
+    completed: int = 0
 
 
 def quota_reset_text(reset: int | None) -> str | None:
@@ -280,7 +293,7 @@ class Window(QMainWindow):
         self.after_task: Callable[[], None] | None = None
         self.operation = ""
         self.closing = False
-        self.export_message = ""
+        self.scale_batch: ScaleBatch | None = None
         self.output_folder: Path | None = None
         self.can_cancel_task = False
         self.recover_task: Callable[[], None] | None = None
@@ -1239,7 +1252,6 @@ class Window(QMainWindow):
         )
         layout = self.image_layout
         self.selected = None
-        self.export_message = ""
         self.comparison.set_source(layout, self.original, self.sprite)
         self._history()
         if self.job is not None and self.task is None:
@@ -1271,10 +1283,16 @@ class Window(QMainWindow):
             label = "Additional instructions for this tile. They take priority over the global prompt."
             existing = snapshot.tiles.get(cell, Tile()).prompt
         text, accepted = QInputDialog.getMultiLineText(self, title, label, existing)
-        if accepted and text.strip() != existing:
+        prompt = text.strip()
+        if accepted and prompt != existing:
+            batch = self._resumable_batch()
             self.job = self.job or self.store.ensure_job(self.source, layout.grid)
-            self.store.set_prompt(self.job, text.strip(), cell)
-            self.export_message = ""
+            self.store.set_prompt(self.job, prompt, cell)
+            if batch is not None:
+                batch.job = self.job
+                if cell is None:
+                    batch.prompt = prompt
+            self._clear_idle_feedback()
             self._history()
             self._refresh()
 
@@ -1365,6 +1383,9 @@ class Window(QMainWindow):
             pausing = self.task.pause.is_set()
             self.generate.setText("Pausing…" if pausing else "Pause")
             self.generate.setEnabled(not pausing and not self.task.cancelled.is_set())
+        elif self._resumable_batch() is not None:
+            self.generate.setText("Resume batch")
+            self.generate.setEnabled(not busy)
         else:
             remaining = ready < count or any(tile.attempt for tile in snapshot.tiles.values())
             if count and ready == count and not remaining:
@@ -1405,8 +1426,6 @@ class Window(QMainWindow):
             if timestamp := quota_reset_text(snapshot.quota_reset):
                 notice += f" Resets at {timestamp}."
             return f"{summary}\n{notice}"
-        if self.export_message:
-            return f"{summary}\n{self.export_message}"
         return summary
 
     def _choose_codex(self):
@@ -1428,7 +1447,10 @@ class Window(QMainWindow):
                 self._set_feedback("Pausing after the current work finishes…", busy=True)
                 self._refresh()
             return
-        if self.image_layout:
+        batch = self._resumable_batch()
+        if batch is not None:
+            self._run_batch(batch)
+        elif self.image_layout:
             self._start(self.image_layout.cells)
 
     def _start_preview(self):
@@ -1578,14 +1600,33 @@ class Window(QMainWindow):
             return
         self.settings.setValue("scales", field.text())
         self.settings.setValue("chainedScales", mode.currentData())
+        self._run_batch(ScaleBatch(source, tuple(layouts), Path(parent), self._snapshot().prompt, self.job, self.grid))
+
+    def _resumable_batch(self) -> ScaleBatch | None:
+        batch = self.scale_batch
+        if batch is not None and (batch.source, batch.job, batch.grid) == (self.source, self.job, self.grid):
+            return batch
+        return None
+
+    def _run_batch(self, batch: ScaleBatch):
+        self.scale_batch = batch
+        batch.completed = 0
+        published = dict(batch.published)
+        labels = {
+            layout.scale: f"Scale {index}/{len(batch.layouts)} · {layout.scale}×"
+            for index, layout in enumerate(batch.layouts, 1)
+        }
         use_subagents = self.subagents.isChecked()
         executable = self._codex_resolver()
-        prompt = self._snapshot().prompt
-        displayed_input = self.job.input_path if self.job else source.path
-        self.export_message = ""
+        displayed_input = self.job.input_path if self.job else batch.source.path
 
         def generate(update, pause, cancel):
             input_path = displayed_input
+            outcome = RunOutcome()
+            # The worker records output checkpoints. The window reads them after the task returns.
+            self.store.check_export_destination(batch.folder or batch.parent)
+            if batch.folder is None:
+                batch.folder = Path(mkdtemp(prefix=f"{Path(batch.source.name).stem}-scales-", dir=batch.parent))
 
             def stage(job, image):
                 nonlocal input_path
@@ -1596,30 +1637,52 @@ class Window(QMainWindow):
                     sprite = image if image.mode == "RGBA" else None
                     update((job, qimage(np.asarray(image)), sprite))
 
-            return run_scale_batch(
-                self.store, source, layouts, executable, Path(parent),
-                pause=pause, cancelled=cancel, prompt=prompt, subagents=use_subagents,
-                on_stage=stage, on_change=update, on_export=lambda scale: update(f"Exporting {scale}× PNG…"),
+            def checkpoint(job, _destination, revision, digest):
+                batch.published[job.scale] = (revision, digest)
+                batch.completed += 1
+
+            def stopped(result):
+                nonlocal outcome
+                outcome = result
+
+            outputs = run_scale_batch(
+                self.store, batch.source, batch.layouts, executable, batch.parent,
+                pause=pause, cancelled=cancel, prompt=batch.prompt, subagents=use_subagents,
+                on_stage=stage, on_change=update, on_export=lambda scale: update(f"{labels[scale]} · Exporting PNG…"),
+                folder=batch.folder, published=published, on_published=checkpoint, on_outcome=stopped, protect_outputs=True,
             )
+            return outcome, outputs
 
-        self._launch("scale_batch", generate, self._batch_finished, self._batch_update, message="Preparing scale batch…")
+        stage_label, stage_cells = "", ()
 
-    def _batch_update(self, update):
-        if isinstance(update, tuple):
-            job, image, sprite = update
-            if image is not None:
-                self._set_input(image, sprite)
-            self._show_grid(job.grid, job)
-        elif isinstance(update, str):
-            self.status.setText(update)
-        else:
-            self._generation_update(update, "Generating tiles", self.job.layout.cells)
+        def update(state):
+            nonlocal stage_label, stage_cells
+            if isinstance(state, tuple):
+                job, image, sprite = state
+                batch.job, batch.grid = job, job.grid
+                stage_label, stage_cells = labels[job.scale], job.layout.cells
+                if image is not None:
+                    self._set_input(image, sprite)
+                self.active = None
+                self._show_grid(job.grid, job)
+                self._report_tiles(stage_label, self._snapshot(), stage_cells)
+            elif isinstance(state, str):
+                self._report_progress(state)
+            else:
+                self._generation_update(state, stage_label, stage_cells)
+
+        self._launch("scale_batch", generate, self._batch_finished, update, message="Preparing scale batch…")
 
     def _batch_finished(self, result):
-        if result is not None:
-            folder, completed, count = result
-            self.export_message = f"Exported {completed}/{count} PNGs · {folder}"
-            self.status.setToolTip(str(folder))
+        outcome, (folder, completed, count) = result
+        summary = f"Exported {completed}/{count} PNGs."
+        if outcome.state == "completed":
+            self.scale_batch = None
+            message = f"Scale batch complete. {summary}"
+        else:
+            message = self._run_message(outcome, "Scale batch", "", "Use Resume batch to continue.")
+            message = f"{message} {summary}"
+        self._set_feedback(message, folder=folder if completed else None)
         self._history()
 
     def _generation_update(self, active: Cell | None, label: str, cells: tuple[Cell, ...], *, previous=None):
@@ -1763,6 +1826,7 @@ class Window(QMainWindow):
 
     def _show_failure(self, error: Exception):
         detail = str(error)
+        folder = None
         if isinstance(error, Cancelled):
             message = detail or "Canceled."
         elif isinstance(error, AuthRequired):
@@ -1790,7 +1854,16 @@ class Window(QMainWindow):
                     "open_fill": "Could not open the generative editor.",
                 }.get(self.operation, "Could not complete the operation.")
                 message = f"{prefix} {detail}"
-        self._set_feedback(message)
+        if self.operation == "scale_batch":
+            batch = self.scale_batch
+            conflict = isinstance(error, FileExistsError)
+            if conflict:
+                message += " Move or rename the conflicting file, or use Generate scale batch to choose another folder."
+            elif isinstance(error, OSError):
+                message += " Check the destination or choose another folder."
+            message += f" Exported {batch.completed}/{len(batch.layouts)} PNGs. Use Resume batch to continue."
+            folder = batch.folder if batch.completed or conflict else None
+        self._set_feedback(message, folder=folder)
 
     def _request_cancel(self):
         if self.task is not None and not self.task.cancelled.is_set():
