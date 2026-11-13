@@ -14,7 +14,7 @@ from PySide6.QtCore import QObject, QRectF, QThreadPool, QTimer, Qt
 from PySide6.QtGui import QImage, QPainter, QPixmap
 
 from .codex import Cancelled
-from .document import RASTER_TILE_SIZE, Document, Layer, _adjust, box, render
+from .document import RASTER_TILE_SIZE, Document, Layer, _adjust, render, sample_asset
 from .editor_tasks import EditorTask
 from .geometry import Rect
 from .viewer import qimage
@@ -121,7 +121,7 @@ class PreviewTiles:
         self.bytes = 0
         self._tiles = OrderedDict()
 
-    def tile(self, layer: Layer, step: int, x: int, y: int, cancelled, *, store=True):
+    def tile(self, layer: Layer, step: int, x: int, y: int, cancelled):
         if cancelled():
             raise Cancelled("Preview superseded.")
         assets = tuple(asset for asset in (layer.image, layer.mask, layer.coverage) if asset is not None)
@@ -140,64 +140,35 @@ class PreviewTiles:
             pixels = Image.frombytes("RGBA", (rgba.width(), rgba.height()), rgba.constBits())
             tile = _Tile(_premultiplied(_adjust(pixels, layer.adjustments)), base.coverage)
         else:
-            tile = self._prepare(layer, step, x, y, cancelled)
+            tile = self._prepare(layer, step, x, y)
 
-        if store and tile.bytes <= self.max_bytes:
+        if tile.bytes <= self.max_bytes:
             while self.bytes + tile.bytes > self.max_bytes:
                 self.bytes -= self._tiles.popitem(last=False)[1][1].bytes
             self._tiles[key] = tuple(ref(asset) for asset in assets), tile
             self.bytes += tile.bytes
         return tile
 
-    def _prepare(self, layer, step, x, y, cancelled):
+    def _prepare(self, layer, step, x, y):
         width = min(RASTER_TILE_SIZE * step, layer.image.width - x)
         height = min(RASTER_TILE_SIZE * step, layer.image.height - y)
-        size = (width + step - 1) // step, (height + step - 1) // step
-        # Bound the source reads even at a very coarse zoom. Intermediate tiles
-        # from the recursion do not evict the cache for the displayed levels.
-        if width * height <= 1_048_576:
-            region = x, y, x + width, y + height
-            pixels = layer.image.crop(region)
-            mask = layer.mask.crop(region) if layer.mask is not None else None
-            coverage = None
-            if layer.coverage is not None:
-                weight = layer.coverage.crop(region)
-                if mask is not None:
-                    weight = ImageChops.multiply(weight, mask)
-                alpha = pixels.getchannel("A")
-                # The replacement may erase the lower layer even with zero source alpha.
-                pixels.putalpha(ImageChops.multiply(alpha, weight))
-                coverage = Image.new("RGBA", pixels.size)
-                coverage.putalpha(weight)
-            elif mask is not None:
-                pixels.putalpha(ImageChops.multiply(pixels.getchannel("A"), mask))
-            tile = _Tile(_premultiplied(pixels), _premultiplied(coverage) if coverage is not None else None)
-        else:
-            half_step = step // 2
-            span = RASTER_TILE_SIZE * half_step
-            width_at_half = (width + half_step - 1) // half_step
-            height_at_half = (height + half_step - 1) // half_step
-            pixels = _surface(width_at_half, height_at_half)
-            coverage = _surface(width_at_half, height_at_half) if layer.coverage is not None else None
-            with QPainter(pixels) as image_painter, QPainter() as weight_painter:
-                if coverage is not None:
-                    weight_painter.begin(coverage)
-                for top in range(y, y + height, span):
-                    for left in range(x, x + width, span):
-                        child = self.tile(layer, half_step, left, top, cancelled, store=False)
-                        col, row = (left - x) // half_step, (top - y) // half_step
-                        image_painter.drawImage(col, row, child.pixels)
-                        if coverage is not None:
-                            weight_painter.drawImage(col, row, child.coverage)
-            tile = _Tile(pixels, coverage)
-
-        if step == 1:
-            return tile
-        return _Tile(
-            tile.pixels.scaled(*size, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation),
-            tile.coverage.scaled(*size, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            if tile.coverage is not None else None,
-        )
+        region = Rect(x, y, x + width, y + height)
+        # Read only the pixels needed for the interactive level. The settled
+        # preview renders the original pixels and filters them with Lanczos.
+        pixels = sample_asset(layer.image, region, step)
+        mask = sample_asset(layer.mask, region, step) if layer.mask is not None else None
+        coverage = None
+        if layer.coverage is not None:
+            weight = sample_asset(layer.coverage, region, step)
+            if mask is not None:
+                weight = ImageChops.multiply(weight, mask)
+            # The replacement may erase the lower layer even with zero source alpha.
+            pixels.putalpha(ImageChops.multiply(pixels.getchannel("A"), weight))
+            coverage = Image.new("RGBA", pixels.size)
+            coverage.putalpha(weight)
+        elif mask is not None:
+            pixels.putalpha(ImageChops.multiply(pixels.getchannel("A"), mask))
+        return _Tile(_premultiplied(pixels), _premultiplied(coverage) if coverage is not None else None)
 
 
 def _at_opacity(image, opacity):

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication
 import regimagen.editor as editor_module
 import regimagen.editor_preview as preview_module
 from regimagen.codex import Cancelled
-from regimagen.document import Document, Layer, render
+from regimagen.document import Document, Layer, paste_pixels, render, sample_asset
 from regimagen.editor import Editor
 from regimagen.editor_preview import PreviewRegion, PreviewTiles, exact_preview, interactive_preview, interactive_region
 from regimagen.geometry import Rect
@@ -66,6 +66,42 @@ def test_preview_reuses_position_independent_tiles_and_preserves_fill_alpha(qt_a
     interactive_preview(document, region, limited, available)
     assert 0 < limited.bytes <= limited.max_bytes
     assert interactive_region(document.bounds, 0.26).step == 4
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "L"])
+def test_coarse_samples_match_raster_edits_and_partial_tiles(mode):
+    rng = np.random.default_rng(26)
+
+    def pixels(width, height):
+        shape = (height, width, 4) if mode == "RGBA" else (height, width)
+        return Image.fromarray(rng.integers(0, 256, size=shape, dtype=np.uint8))
+
+    base = pixels(719, 617)
+    edited = paste_pixels(base, pixels(400, 380), (240, 230))
+    edited = paste_pixels(edited, pixels(26, 29), (693, 588))
+    for asset in (base, edited):
+        for area in (Rect(3, 17, 719, 617), Rect(260, 260, 401, 466), Rect(702, 600, 719, 617)):
+            crop = np.asarray(asset.crop((area.left, area.top, area.right, area.bottom)))
+            for step in (1, 2, 4, 8, 16, 64, 512, 1024):
+                sampled = np.asarray(sample_asset(asset, area, step))
+                np.testing.assert_array_equal(sampled, crop[::step, ::step])
+
+
+def test_coarse_fill_samples_coverage_and_alpha_on_same_grid(qt_app):
+    size = (1031, 1031)
+    base = Layer("Base", Image.new("RGBA", size, "white"))
+    pixels = Image.new("RGBA", size, "blue")
+    pixels = paste_pixels(pixels, Image.new("RGBA", (15, 15)), (1016, 1016))
+    coverage = Image.new("L", size, 255)
+    mask = paste_pixels(Image.new("L", size, 0), Image.new("L", (9, 9), 255), (1022, 1022))
+    fill = Layer("Fill", pixels, coverage=coverage, mask=mask)
+    document = Document("Coarse", *size, (base, fill))
+    region = interactive_region(document.bounds, 0.25)
+    image = interactive_preview(document, region, PreviewTiles(), lambda: False)
+    last = image.width() - 1
+    assert image.pixelColor(last, last).getRgb() == (0, 0, 0, 0)
+    assert image.pixelColor(last - 1, last - 1).getRgb() == (0, 0, 0, 0)
+    assert image.pixelColor(last - 3, last - 3).getRgb() == (255, 255, 255, 255)
 
 
 def test_exact_preview_matches_serial_stripes_with_transparency(qt_app, monkeypatch):

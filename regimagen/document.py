@@ -34,6 +34,17 @@ def _tiles(area: Rect, size: tuple[int, int]):
             yield (left, top), Rect(left, top, min(left + step, width), min(top + step, height))
 
 
+def _sample_grid(image: Image.Image, area: Rect, step: int) -> Image.Image:
+    if step == 1:
+        return image.crop(box(area))
+    size = (area.width + step - 1) // step, (area.height + step - 1) // step
+    # Map each output center to the center of the first source pixel in its block.
+    return image.transform(size, Image.Transform.AFFINE, (
+        step, 0, area.left - (step - 1) / 2,
+        0, step, area.top - (step - 1) / 2,
+    ), Image.Resampling.NEAREST)
+
+
 @dataclass(frozen=True, eq=False)
 class Raster:
     """An immutable source image with replacement tiles shared by edit history."""
@@ -70,6 +81,36 @@ class Raster:
                     result.paste(pixels.crop(box(local)), (overlap.left - area.left, overlap.top - area.top))
         return result
 
+    def sample(self, area: Rect, step: int) -> Image.Image:
+        """Take a strided sample from an in-bounds rectangle, including raster edits."""
+        if step == 1:
+            return self.crop(box(area))
+        result = _sample_grid(self._base, area, step)
+        grid = RASTER_TILE_SIZE
+        left, top = area.left // grid, area.top // grid
+        columns = (area.right - 1) // grid - left + 1
+        rows = (area.bottom - 1) // grid - top + 1
+        if len(self._tiles) < columns * rows:
+            patches = self._tiles.items()
+        else:
+            patches = ((origin, self._tiles.get(origin)) for origin, _ in _tiles(area, self.size))
+        for (x, y), pixels in patches:
+            if pixels is None:
+                continue
+            overlap = area.intersect(Rect(x, y, x + pixels.width, y + pixels.height))
+            if overlap is None:
+                continue
+            offset = overlap.relative_to(area)
+            first_col, last_col = (offset.left + step - 1) // step, (offset.right + step - 1) // step
+            first_row, last_row = (offset.top + step - 1) // step, (offset.bottom + step - 1) // step
+            if first_col < last_col and first_row < last_row:
+                sample = Rect(
+                    area.left + first_col * step - x, area.top + first_row * step - y,
+                    overlap.right - x, overlap.bottom - y,
+                )
+                result.paste(_sample_grid(pixels, sample, step), (first_col, first_row))
+        return result
+
     def getpixel(self, point: tuple[int, int]):
         x, y = point
         x = x + self.width if x < 0 else x
@@ -83,6 +124,11 @@ class Raster:
 
 
 type PixelAsset = Image.Image | Raster
+
+
+def sample_asset(asset: PixelAsset, area: Rect, step: int) -> Image.Image:
+    """Sample the first pixel of each step-sized block in an in-bounds rectangle."""
+    return asset.sample(area, step) if isinstance(asset, Raster) else _sample_grid(asset, area, step)
 
 
 def asset_image(asset: PixelAsset) -> Image.Image:
