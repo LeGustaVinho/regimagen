@@ -112,20 +112,26 @@ class _Tile:
     def bytes(self):
         return self.pixels.sizeInBytes() + (self.coverage.sizeInBytes() if self.coverage is not None else 0)
 
+    def at_opacity(self, opacity):
+        if opacity == 100:
+            return self
+        # Apply opacity before Plus, which would otherwise clip the unscaled sum.
+        return _Tile(_at_opacity(self.pixels, opacity), _at_opacity(self.coverage, opacity))
+
 
 class PreviewTiles:
-    """Worker-owned cache of premultiplied tiles, independent of layer position and opacity."""
+    """Worker-owned cache of premultiplied tiles, independent of layer position."""
 
     def __init__(self, max_bytes=PREVIEW_CACHE_BYTES):
         self.max_bytes = max_bytes
         self.bytes = 0
         self._tiles = OrderedDict()
 
-    def tile(self, layer: Layer, step: int, x: int, y: int, cancelled):
+    def tile(self, layer: Layer, step: int, x: int, y: int, cancelled, *, opacity=100, store=True):
         if cancelled():
             raise Cancelled("Preview superseded.")
         assets = tuple(asset for asset in (layer.image, layer.mask, layer.coverage) if asset is not None)
-        key = id(layer.image), id(layer.mask), id(layer.coverage), step, x, y, layer.adjustments
+        key = id(layer.image), id(layer.mask), id(layer.coverage), step, x, y, layer.adjustments, opacity
         cached = self._tiles.get(key)
         if cached is not None:
             references, tile = cached
@@ -134,15 +140,20 @@ class PreviewTiles:
                 return tile
             self.bytes -= self._tiles.pop(key)[1].bytes
 
-        if any(layer.adjustments):
-            base = self.tile(replace(layer, adjustments=(0, 0, 0)), step, x, y, cancelled)
+        if opacity != 100:
+            # The weighted tile suffices for movement and navigation. Reuse any
+            # existing source tile, without filling the cache with both copies.
+            base = self.tile(layer, step, x, y, cancelled, store=False)
+            tile = base.at_opacity(opacity)
+        elif any(layer.adjustments):
+            base = self.tile(replace(layer, adjustments=(0, 0, 0)), step, x, y, cancelled, store=store)
             rgba = base.pixels.convertToFormat(QImage.Format.Format_RGBA8888)
             pixels = Image.frombytes("RGBA", (rgba.width(), rgba.height()), rgba.constBits())
             tile = _Tile(_premultiplied(_adjust(pixels, layer.adjustments)), base.coverage)
         else:
             tile = self._prepare(layer, step, x, y)
 
-        if tile.bytes <= self.max_bytes:
+        if store and tile.bytes <= self.max_bytes:
             while self.bytes + tile.bytes > self.max_bytes:
                 self.bytes -= self._tiles.popitem(last=False)[1][1].bytes
             self._tiles[key] = tuple(ref(asset) for asset in assets), tile
@@ -172,8 +183,6 @@ class PreviewTiles:
 
 
 def _at_opacity(image, opacity):
-    if opacity == 100:
-        return image
     result = _surface(image.width(), image.height())
     with QPainter(result) as painter:
         painter.setOpacity(opacity / 100)
@@ -189,8 +198,10 @@ def interactive_preview(document, region, tiles, cancelled, draft=None):
         painter.scale(region.size[0] / area.width, region.size[1] / area.height)
         painter.translate(-area.left, -area.top)
         for layer in document.layers:
+            changing_opacity = False
             if draft is not None and layer.id == draft[0]:
                 layer = replace(layer, **draft[1])
+                changing_opacity = "opacity" in draft[1]
             if not layer.visible or not layer.opacity:
                 continue
             bounds = layer.bounds
@@ -198,9 +209,10 @@ def interactive_preview(document, region, tiles, cancelled, draft=None):
             if overlap is None:
                 continue
             local = overlap.relative_to(bounds)
+            tile_opacity = layer.opacity if layer.coverage is not None and not changing_opacity else 100
             for y in range(local.top // span * span, local.bottom, span):
                 for x in range(local.left // span * span, local.right, span):
-                    tile = tiles.tile(layer, step, x, y, cancelled)
+                    tile = tiles.tile(layer, step, x, y, cancelled, opacity=tile_opacity)
                     destination = QRectF(
                         layer.x + x, layer.y + y, min(span, bounds.width - x), min(span, bounds.height - y),
                     )
@@ -209,13 +221,13 @@ def interactive_preview(document, region, tiles, cancelled, draft=None):
                         painter.setOpacity(layer.opacity / 100)
                         painter.drawImage(destination, tile.pixels)
                     else:
-                        # Scale both inputs before Plus, which otherwise clips the
-                        # unscaled sum before applying the painter's opacity.
+                        if changing_opacity:
+                            tile = tile.at_opacity(layer.opacity)
                         painter.setOpacity(1)
                         painter.setCompositionMode(_MODE.CompositionMode_DestinationOut)
-                        painter.drawImage(destination, _at_opacity(tile.coverage, layer.opacity))
+                        painter.drawImage(destination, tile.coverage)
                         painter.setCompositionMode(_MODE.CompositionMode_Plus)
-                        painter.drawImage(destination, _at_opacity(tile.pixels, layer.opacity))
+                        painter.drawImage(destination, tile.pixels)
     return image
 
 

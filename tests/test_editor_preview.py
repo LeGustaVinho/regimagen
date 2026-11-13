@@ -68,6 +68,33 @@ def test_preview_reuses_position_independent_tiles_and_preserves_fill_alpha(qt_a
     assert interactive_region(document.bounds, 0.26).step == 4
 
 
+def test_static_fill_opacity_is_reused_and_slider_values_do_not_fill_cache(qt_app, monkeypatch):
+    size = (300, 260)
+    base = Layer("Base", Image.new("RGBA", size, "red"))
+    fill = Layer("Fill", Image.new("RGBA", size, "blue"), opacity=70, coverage=Image.new("L", size, 120))
+    document = Document("Fill opacity", *size, (base, fill))
+    region = interactive_region(document.bounds, 1)
+    available = lambda: False
+    cache = PreviewTiles(max_bytes=1_000_000)
+    scale = preview_module._at_opacity
+    calls = []
+
+    def count(image, opacity):
+        calls.append(opacity)
+        return scale(image, opacity)
+
+    monkeypatch.setattr(preview_module, "_at_opacity", count)
+    interactive_preview(document, region, cache, available)
+    assert calls and set(calls) == {70}
+    calls.clear()
+    interactive_preview(document, region, cache, available, (fill.id, {"x": -10}))
+    assert calls == []
+    for opacity in (15, 20, 45, 65):
+        interactive_preview(document, region, cache, available, (fill.id, {"opacity": opacity}))
+    assert {key[-1] for key in cache._tiles} <= {70, 100}
+    assert cache.bytes <= cache.max_bytes
+
+
 @pytest.mark.parametrize("mode", ["RGBA", "L"])
 def test_coarse_samples_match_raster_edits_and_partial_tiles(mode):
     rng = np.random.default_rng(26)
