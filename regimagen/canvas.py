@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 from PIL import Image, ImageChops
-from PySide6.QtCore import QPointF, QRectF, QTimer, Qt, Signal
+from PySide6.QtCore import QPointF, QRect, QRectF, QTimer, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap, QTransform
 
 from .viewer import ImageView, qimage
@@ -61,6 +61,57 @@ def selection_overlay(mask: Image.Image, bounds: tuple[int, int, int, int]) -> Q
     return qimage(overlay).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
 
 
+class _BrushPreview:
+    """Rasterize each batch into a viewport-sized overlay for the uncommitted stroke."""
+
+    def __init__(self, start: QPointF, pen: QPen):
+        self._path = QPainterPath(start)
+        self._pending = QPainterPath(start)
+        self._pen = QPen(pen)
+        color = pen.color()
+        self.opacity = color.alphaF()
+        color.setAlpha(255)
+        self._pen.setColor(color)
+        self._view = None
+        self.image = QImage()
+        self.bounds = QRect()
+
+    def append(self, point: QPointF):
+        self._path.lineTo(point)
+        self._pending.lineTo(point)
+
+    def render(self, viewport, transform: QTransform) -> QRect:
+        ratio = viewport.devicePixelRatioF()
+        view = viewport.size(), ratio, transform
+        previous = QRect()
+        if view != self._view:
+            self._view = view
+            previous, self.bounds = self.bounds, QRect()
+            self.image = QImage(
+                math.ceil(viewport.width() * ratio), math.ceil(viewport.height() * ratio),
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            self.image.setDevicePixelRatio(ratio)
+            self.image.fill(Qt.GlobalColor.transparent)
+            path = self._path
+        else:
+            path = self._pending
+        self._pending = QPainterPath(self._path.currentPosition())
+        if path.isEmpty() or self.image.isNull():
+            return previous
+        with QPainter(self.image) as painter:
+            painter.setWorldTransform(transform)
+            painter.strokePath(path, self._pen)
+        radius = self._pen.widthF() / 2
+        if not self._pen.isCosmetic():
+            radius *= transform.m11()
+        radius += 2
+        damage = transform.mapRect(path.controlPointRect()).adjusted(-radius, -radius, radius, radius)
+        damage = damage.toAlignedRect().intersected(viewport.rect())
+        self.bounds = self.bounds.united(damage)
+        return previous.united(damage)
+
+
 class CanvasView(ImageView):
     stroke_started = Signal()
     stroke_finished = Signal(QPainterPath)
@@ -87,6 +138,7 @@ class CanvasView(ImageView):
         self._checker = self._checker_texture()
         self._start: QPointF | None = None
         self._stroke: QPainterPath | None = None
+        self._brush_stroke: _BrushPreview | None = None
         self._stroke_timer = QTimer(self, singleShot=True, interval=16, timerType=Qt.TimerType.PreciseTimer)
         self._stroke_timer.timeout.connect(self._show_stroke)
         self._pan_position = None
@@ -96,6 +148,8 @@ class CanvasView(ImageView):
         self._fitted = True
         self._tool = "lasso"
         self.resized.connect(self._fit_if_needed)
+        self.resized.connect(self._refresh_brush)
+        self.moved.connect(self._refresh_brush)
         self._update_cursor()
         if base is not None:
             self.set_size((base.width(), base.height()))
@@ -117,6 +171,17 @@ class CanvasView(ImageView):
         scale = self.transform().m11()
         brush.setTransform(QTransform.fromScale(1 / scale, 1 / scale))
         painter.fillRect(rect.intersected(self.sceneRect()), brush)
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        stroke = self._brush_stroke
+        if stroke is not None and not stroke.image.isNull():
+            painter.save()
+            painter.resetTransform()
+            # Apply opacity once, even where batches overlap at joins and crossings.
+            painter.setOpacity(stroke.opacity)
+            painter.drawImage(QPointF(), stroke.image)
+            painter.restore()
 
     def set_size(self, size: tuple[int, int]):
         self.setSceneRect(0, 0, *size)
@@ -199,6 +264,9 @@ class CanvasView(ImageView):
     def _clear_gesture(self):
         self._start = self._stroke = None
         self._stroke_timer.stop()
+        if self._brush_stroke is not None:
+            self.viewport().update(self._brush_stroke.bounds)
+            self._brush_stroke = None
         if not self._stroke_item.path().isEmpty():
             self._stroke_item.setPath(QPainterPath())
 
@@ -223,21 +291,27 @@ class CanvasView(ImageView):
         if self._drawing_enabled and button == Qt.MouseButton.LeftButton and self.sceneRect().contains(point):
             self.setFocus()
             self._start = point
-            self._stroke = QPainterPath(point) if self._tool != "move" else None
+            if self._tool in ("brush", "eraser"):
+                self._brush_stroke = _BrushPreview(point, self._brush_pen)
+            elif self._tool != "move":
+                self._stroke = QPainterPath(point)
             if self._tool in SELECTION_TOOLS:
                 self._stroke_item.setPen(self._outline)
                 self.stroke_started.emit()
             else:
-                self._stroke_item.setPen(self._brush_pen)
+                if self._stroke is not None:
+                    self._stroke_item.setPen(self._brush_pen)
                 self.pointer_started.emit(point)
             event.accept()
             return
         super().mousePressEvent(event)
 
     def _update_stroke(self, point: QPointF):
-        if self._stroke is None:
+        if self._brush_stroke is not None:
+            self._brush_stroke.append(point)
+        elif self._stroke is None:
             return
-        if self._tool == "rectangle":
+        elif self._tool == "rectangle":
             self._stroke = QPainterPath()
             self._stroke.addRect(QRectF(self._start, point).normalized())
         else:
@@ -246,8 +320,16 @@ class CanvasView(ImageView):
             self._stroke_timer.start()
 
     def _show_stroke(self):
-        if self._stroke is not None:
+        if self._brush_stroke is not None:
+            self._refresh_brush()
+        elif self._stroke is not None:
             self._stroke_item.setPath(self._stroke)
+
+    def _refresh_brush(self):
+        if self._brush_stroke is not None:
+            damage = self._brush_stroke.render(self.viewport(), self.viewportTransform())
+            if not damage.isEmpty():
+                self.viewport().update(damage)
 
     def mouseMoveEvent(self, event):
         if self._pan_position is not None:
