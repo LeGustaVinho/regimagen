@@ -374,6 +374,9 @@ class Editor(QWidget):
         self._commit(layer.name if layer is not None and layer.coverage is not None else "Generative Fill",
                      _State(document, layer_id, selection))
 
+    def apply_removal(self, document: Document, layer_id: str):
+        self._commit("Generative Remove", _State(document, layer_id, None))
+
     def _commit(self, label: str, state: _State):
         self.undo.push(_Edit(label, self._state, state, self._restore))
 

@@ -235,7 +235,7 @@ class FillEditor(QWidget):
         with QSignalBlocker(self._chooser):
             self._chooser.addItem("Saved variation" if already_applied else f"Variation {count}", already_applied)
             self._chooser.setCurrentIndex(count - 1)
-        self._after.setChecked(True)
+        self._select_generated_view()
         self._show_preview()
         self._refresh()
 
@@ -268,25 +268,30 @@ class FillEditor(QWidget):
         self._before.setChecked(True)
         self._show_preview()
 
+    def _select_generated_view(self):
+        self._after.setChecked(True)
+
     def _select_variant(self, index: int):
         if index >= 0:
-            self._after.setChecked(True)
+            self._select_generated_view()
         self._show_preview()
         self._refresh()
 
     def _show_preview(self):
         index = self.selected_variant
-        showing_after = self._after.isChecked() and index is not None
+        preview = self._variants[index] if self._after.isChecked() and index is not None else None
+        self._display_preview(preview)
+
+    def _display_preview(self, preview: FillPreview | None):
         display = self._base
-        if showing_after:
-            preview = self._variants[index]
+        if preview is not None:
             display = QPixmap(self._base)
             painter = QPainter(display)
             # Replace the base alpha as well so a cutout reveals the checkerboard.
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
             painter.drawPixmap(*preview.origin, pixmap(preview.patch))
             painter.end()
-        self._canvas.set_image(display, selection_visible=not showing_after)
+        self._canvas.set_image(display, selection_visible=preview is None)
 
     def _refresh(self):
         selected = self._bounds is not None

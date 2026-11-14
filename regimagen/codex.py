@@ -286,11 +286,14 @@ class CodexClient:
             effort="low",
         )
 
-    def analyze_images(self, prompt: str, references: tuple[Path, ...], schema: dict) -> dict:
+    def analyze_images(
+        self, prompt: str, references: tuple[Path, ...], schema: dict, *, effort: str | None = None,
+    ) -> dict:
         attachments = [{"type": "localImage", "path": str(path.resolve())} for path in references]
+        options = {"effort": effort} if effort else {}
         return self._run_turn(
             [{"type": "text", "text": prompt}, *attachments], self._wait_analysis,
-            output_schema=schema,
+            output_schema=schema, **options,
         )
 
     def _wait_analysis(self, thread_id: str, turn_id: str, events: list[dict]) -> dict:

@@ -1,7 +1,7 @@
 """Regimagen's main window."""
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from hashlib import file_digest
 from pathlib import Path
@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 from threading import Event
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops
 from PySide6.QtCore import QPointF, QRectF, QSettings, QSignalBlocker, QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFontDatabase, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -22,9 +22,10 @@ from PySide6.QtWidgets import (
 
 from .codex import Cancelled, CodexError, find_codex
 from .composite import export_parts, export_png
-from .document import Document, box, export_document, render
+from .document import Document, Layer, box, export_document, render
 from .document_fill import (
-    ActiveFillTarget, LayeredVariant, active_fill_target, fill_reference, layered_variant, render_layer_fill,
+    ActiveFillTarget, LayeredVariant, RemovalVariant, active_fill_target, fill_reference, removal_variant,
+    removed_object_layers, render_layer_fill,
 )
 from .editor import Editor, dimensions
 from .files import atomic_output, load_source
@@ -35,8 +36,8 @@ from .geometry import (
 )
 from .jobs import load_job_input, pending_cells, refresh_thumbnails, run_scale_batch, run_tiles
 from .project import PROJECT_SUFFIX, load_project, save_project
-from .remove_detection import detect_removal, segment_removal_click, segment_removal_lasso
-from .remove_editor import RemoveEditor
+from .remove_detection import detect_removal, detect_removal_effects
+from .remove_editor import RemovalInputs, RemoveEditor
 from .storage import FillEdit, Job, Snapshot, Source, Store, Tile
 from .viewer import Comparison, qimage
 
@@ -108,6 +109,15 @@ class LayerFillSession:
     editor: FillEditor
     target: ActiveFillTarget | None
     variants: list[LayeredVariant] = field(default_factory=list)
+
+
+@dataclass
+class RemoveSession(LayerFillSession):
+    prepared: tuple[RemovalInputs, tuple[Layer, ...]] | None = None
+
+    def clear_variants(self):
+        self.variants.clear()
+        self.prepared = None
 
 
 def tile_state(tile: Tile) -> tuple[str, str]:
@@ -622,18 +632,18 @@ class Window(QMainWindow):
             if remove:
                 editor = RemoveEditor(image, mask=selection)
                 editor.detect_requested.connect(self._detect_remove)
-                editor.semantic_detection_requested.connect(lambda: self._detect_remove(semantic=True))
                 editor.generate_requested.connect(self._generate_remove)
             else:
                 editor = FillEditor(image, mask=selection, layered=True, active_target=active)
                 editor.generate_requested.connect(self._generate_fill)
             editor.set_busy(True)
-            session = self.layer_fill = LayerFillSession(document, editor, target)
+            session_type = RemoveSession if remove else LayerFillSession
+            session = self.layer_fill = session_type(document, editor, target)
             editor.cancel_requested.connect(self._cancel_fill)
             editor.apply_requested.connect(self._apply_layer_fill)
             editor.discard_requested.connect(self._close_layer_fill)
-            if remove:
-                editor.changed.connect(session.variants.clear)
+            if isinstance(session, RemoveSession):
+                editor.changed.connect(session.clear_variants)
             else:
                 editor.changed.connect(self._layer_fill_changed)
             self.stack.addWidget(editor)
@@ -643,7 +653,7 @@ class Window(QMainWindow):
 
     def _remove_session(self):
         session = self.layer_fill
-        if self.task is not None or session is None or not isinstance(session.editor, RemoveEditor):
+        if self.task is not None or not isinstance(session, RemoveSession):
             return None
         if session.document is not self.editor.document:
             self._close_layer_fill()
@@ -651,34 +661,31 @@ class Window(QMainWindow):
             return None
         return session
 
-    def _detect_remove(self, *, semantic=False):
+    def _detect_remove(self):
         session = self._remove_session()
         if session is None:
             return
         editor = session.editor
         image, _ = editor.generation_input()
         selection, points = editor.detection_mask, editor.detection_points
+        inputs = editor.removal_inputs()
+        if inputs is not None and inputs.direct:
+            selection = inputs.core
         if not points and selection.getbbox() is None:
             return
         executable = self._codex_resolver()
 
         def detect(_update, _pause, cancel):
-            if not semantic:
-                if points:
-                    targets = segment_removal_click(image, points[0], cancelled=cancel)
-                else:
-                    targets = segment_removal_lasso(image, selection, cancelled=cancel)
-                if targets:
-                    return targets, None
-            if cancel.is_set():
-                raise Cancelled("Object detection canceled.")
-            guide = selection
-            if points:
-                x, y = points[0]
-                radius = max(3, min(14, round(min(image.size) * 0.01)))
-                guide = Image.new("L", image.size)
-                ImageDraw.Draw(guide).ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
-            return detect_removal(image, guide, executable(), cancelled=cancel), True
+            path = executable()
+            point = points[0] if points else None
+            targets = detect_removal(image, selection, path, point=point, cancelled=cancel)
+            try:
+                targets = detect_removal_effects(image, targets, path, cancelled=cancel)
+            except Cancelled:
+                raise
+            except CodexError as error:
+                return targets, f"Could not check for cast shadows or reflections. {error}"
+            return targets, ""
 
         def show(result):
             if self.closing:
@@ -686,8 +693,10 @@ class Window(QMainWindow):
             if result is None:
                 editor.set_message("Object detection canceled.")
             else:
-                targets, detailed = result
-                editor.set_targets(targets, detailed=detailed)
+                targets, message = result
+                editor.set_targets(targets, detailed=True)
+                if message:
+                    editor.set_message(message)
 
         self._launch("detect_remove", detect, show)
 
@@ -698,19 +707,60 @@ class Window(QMainWindow):
         inputs = session.editor.removal_inputs()
         if inputs is None:
             return
-        core, footprint, labels = inputs
         image, _ = session.editor.generation_input()
         executable = self._codex_resolver()
         prepare = len(session.variants) % 2 == 1
+        cached = session.prepared
 
-        def generate(_update, _pause, cancel):
-            candidate = generate_remove(image, core, footprint, labels, executable, cancelled=cancel, prepare=prepare)
-            preview = render_remove(image, core, footprint, candidate)
+        def generate(update, _pause, cancel):
+            prepared = cached
+            if prepared is None:
+                approved = inputs
+                if inputs.direct:
+                    path = executable()
+                    targets = detect_removal(image, inputs.core, path, direct=True, cancelled=cancel)
+                    if any(not target.selected and not target.protected and target.parent is None for target in targets):
+                        raise CodexError("Codex returned an uncertain object. Try again or choose Review with Lasso.")
+                    targets = detect_removal_effects(image, targets, path, cancelled=cancel, lasso=inputs.core)
+                    approved = inputs.with_detected_objects(image, targets)
+                    if approved is None:
+                        raise CodexError("Codex could not isolate an object. Try again or choose Review with Lasso.")
+                objects = removed_object_layers(image, approved.core, approved.objects, cancelled=cancel)
+                if not objects:
+                    raise CodexError("No visible objects in the selection. Adjust the selection and try again.")
+                prepared = approved, objects
+                update(prepared)
+            approved, objects = prepared
             if cancel.is_set():
                 raise Cancelled("Removal canceled.")
-            return layered_variant(session.document, footprint, preview, None, name="Generative Remove")
+            candidate = generate_remove(
+                image, approved.core, approved.footprint, approved.labels, executable,
+                cancelled=cancel, prepare=prepare, direct=approved.direct,
+            )
+            preview = render_remove(image, approved.core, approved.footprint, candidate)
+            if approved.warning:
+                preview = replace(preview, warning=" ".join(filter(None, (approved.warning, preview.warning))))
+            if cancel.is_set():
+                raise Cancelled("Removal canceled.")
+            return removal_variant(session.document, approved.footprint, preview, objects, cancelled=cancel)
 
-        self._launch("generate_remove", generate, self._append_layer_variant)
+        def prepared(result):
+            session.prepared = result
+            session.editor.set_message("Reconstructing the background…")
+
+        message = "Isolating objects with Codex…" if inputs.direct and cached is None else "Reconstructing the background…"
+        session.editor.set_message(message)
+        self._launch("generate_remove", generate, self._append_remove_variant, prepared)
+
+    def _append_remove_variant(self, variant: RemovalVariant | None):
+        session = self.layer_fill
+        if not isinstance(session, RemoveSession) or self.closing:
+            return
+        # The result may have been queued before the Cancel click reached the window.
+        if variant is None or (self.task is not None and self.task.cancelled.is_set()):
+            session.editor.set_message("Removal canceled.")
+            return
+        self._append_layer_variant(variant)
 
     def _append_layer_variant(self, variant: LayeredVariant | None):
         session = self.layer_fill
@@ -720,23 +770,22 @@ class Window(QMainWindow):
             session.editor.set_message("Generation canceled.")
         else:
             session.variants.append(variant)
-            session.editor.add_variant(variant.preview)
+            if isinstance(variant, RemovalVariant):
+                session.editor.add_removal_variant(variant.preview, variant.background)
+            else:
+                session.editor.add_variant(variant.preview)
 
     def _apply_layer_fill(self):
         session = self.layer_fill
         if session is None or self.task is not None or not session.editor.can_apply:
             return
-        if isinstance(session.editor, RemoveEditor):
-            if self._remove_session() is None:
-                return
-            inputs = session.editor.removal_inputs()
-            if inputs is None:
-                return
-            selection = inputs[1]
-        else:
-            selection = session.editor.mask
+        if isinstance(session.editor, RemoveEditor) and self._remove_session() is None:
+            return
         variant = session.variants[session.editor.selected_variant]
-        self.editor.apply_fill(variant.document, variant.layer_id, selection)
+        if isinstance(variant, RemovalVariant):
+            self.editor.apply_removal(variant.document, variant.layer_id)
+        else:
+            self.editor.apply_fill(variant.document, variant.layer_id, session.editor.mask)
         self._close_layer_fill()
 
     def _close_layer_fill(self):

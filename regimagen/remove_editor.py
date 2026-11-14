@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import cv2
@@ -12,7 +13,7 @@ from PySide6.QtGui import QColor, QPainterPath, QPen, QPixmap, QTransform
 from PySide6.QtWidgets import QApplication, QGraphicsItem, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton
 
 from .canvas import combine_selection, pixmap
-from .fill import selection_has_visible_pixels
+from .fill import FillPreview, removal_transition_width, selection_has_visible_pixels
 from .fill_editor import FillEditor
 
 if TYPE_CHECKING:
@@ -22,37 +23,114 @@ if TYPE_CHECKING:
 _BINARY = [0] + [255] * 255
 
 
-def _union_target(destination: Image.Image, target: RemovalTarget, *, excluding: RemovalTarget | None = None):
+@dataclass(frozen=True)
+class RemovalInputs:
+    core: Image.Image
+    footprint: Image.Image
+    labels: tuple[str, ...]
+    objects: tuple[RemovalTarget, ...]
+    direct: bool
+    warning: str = ""
+    excluded: Image.Image | None = None
+
+    def with_detected_objects(self, source: Image.Image, targets: tuple[RemovalTarget, ...]) -> RemovalInputs | None:
+        approved = removal_masks(
+            source.size, targets, object_limit=self.core, excluded=self.excluded,
+            source=source, opaque=source.mode == "RGB",
+        )
+        if approved is None:
+            return None
+        objects = {id(target) for target in approved.objects}
+        unresolved = ImageChops.invert(approved.core)
+        if self.excluded is not None:
+            unresolved = ImageChops.subtract(unresolved, self.excluded)
+        uncertain = any(
+            target.parent is not None and not target.selected and not target.protected
+            and id(targets[target.parent]) in objects
+            and ImageChops.darker(unresolved.crop(_target_bounds(target)), target.mask).getbbox() is not None
+            for target in targets
+        )
+        warning = "Codex could not confirm every shadow or reflection. Check the background." if uncertain else ""
+        return replace(approved, direct=True, warning=warning)
+
+
+def _target_bounds(target: RemovalTarget) -> tuple[int, int, int, int]:
     left, top = target.origin
-    area = (left, top, left + target.mask.width, top + target.mask.height)
+    return left, top, left + target.mask.width, top + target.mask.height
+
+
+def _target_coverage(target: RemovalTarget, area: tuple[int, int, int, int]) -> Image.Image:
+    left, top, right, bottom = area
+    x, y = target.origin
+    return target.mask.crop((left - x, top - y, right - x, bottom - y)).point(_BINARY)
+
+
+def _union_target(destination: Image.Image, target: RemovalTarget, *, excluding: Image.Image | None = None):
+    area = _target_bounds(target)
     mask = target.mask
     if excluding is not None:
-        x, y = excluding.origin
-        overlap = excluding.mask.crop((left - x, top - y, area[2] - x, area[3] - y))
-        mask = ImageChops.subtract(mask, overlap.point(_BINARY))
-    destination.paste(ImageChops.lighter(destination.crop(area), mask), (left, top))
+        mask = ImageChops.subtract(mask, excluding)
+    destination.paste(ImageChops.lighter(destination.crop(area), mask), target.origin)
+
+
+def _expand_mask(mask: Image.Image, feather: int) -> Image.Image:
+    pixels = np.asarray(mask)
+    if feather > 12:
+        distance = cv2.distanceTransform((pixels == 0).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_5)
+        return Image.fromarray((distance <= feather).astype(np.uint8) * 255)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * feather + 1, 2 * feather + 1))
+    return Image.fromarray(cv2.dilate(pixels, kernel))
 
 
 def removal_masks(
     size: tuple[int, int], targets: tuple[RemovalTarget, ...], checked: set[int] | None = None, *,
-    manual: Image.Image | None = None, added: Image.Image | None = None, excluded: Image.Image | None = None,
-) -> tuple[Image.Image, Image.Image, tuple[str, ...]] | None:
-    """Return the fully replaced pixels, approved footprint, and confirmed labels."""
+    manual: Image.Image | None = None, excluded: Image.Image | None = None,
+    opaque: bool = True, object_limit: Image.Image | None = None, source: Image.Image | None = None,
+) -> RemovalInputs | None:
+    """Keep the approved object masks alongside the background edit area."""
     if checked is None:
         checked = {index for index, target in enumerate(targets) if target.selected and not target.protected}
-    core = manual.copy() if manual is not None else Image.new("L", size)
     protected = excluded.copy() if excluded is not None else Image.new("L", size)
-    selected = []
+    pending_effects = {}
     for index, target in enumerate(targets):
-        parent = targets[target.parent] if target.parent is not None and target.parent in checked else None
-        if target.protected or index not in checked or (target.parent is not None and parent is None):
-            # A kept effect can only be preserved where its removed parent is not visible.
-            _union_target(protected, target, excluding=None if target.protected else parent)
-        else:
-            _union_target(core, target)
-            selected.append(target)
-    if added is not None:
-        core = ImageChops.lighter(core, added)
+        parent = target.parent
+        if target.protected or (parent is None and index not in checked):
+            _union_target(protected, target)
+        elif parent is None and object_limit is not None:
+            # An effect can extend past the lasso. Preserve parts of the object excluded by it.
+            _union_target(protected, target, excluding=object_limit.crop(_target_bounds(target)))
+        elif parent is not None:
+            if parent not in checked or targets[parent].protected:
+                _union_target(protected, target)
+            elif index in checked:
+                pending_effects[index] = target
+            elif target.selected or not opaque:
+                # An unchecked effect can be preserved outside its caster.
+                _union_target(protected, target, excluding=_target_coverage(targets[parent], _target_bounds(target)))
+    protected = protected.point(_BINARY)
+    core = ImageChops.subtract(manual.point(_BINARY), protected) if manual is not None else Image.new("L", size)
+    objects = {}
+    for index, target in enumerate(targets):
+        if target.protected or target.parent is not None or index not in checked:
+            continue
+        area = _target_bounds(target)
+        mask = ImageChops.subtract(target.mask.point(_BINARY), protected.crop(area))
+        visible = (ImageChops.darker(mask, source.crop(area).getchannel("A"))
+                   if source is not None and source.mode == "RGBA" else mask)
+        if visible.getbbox() is not None:
+            _union_target(core, replace(target, mask=mask))
+            objects[index] = target
+
+    if not objects and manual is None:
+        return None
+
+    effects = {index: target for index, target in pending_effects.items() if target.parent in objects}
+    for index, target in pending_effects.items():
+        if index not in effects:
+            # A fully excluded caster leaves its shadow in the scene.
+            _union_target(protected, target, excluding=core.crop(_target_bounds(target)))
+    for target in effects.values():
+        _union_target(core, target)
     protected = protected.point(_BINARY)
     core = ImageChops.subtract(core.point(_BINARY), protected)
     bounds = core.getbbox()
@@ -60,20 +138,38 @@ def removal_masks(
         return None
 
     left, top, right, bottom = bounds
-    feather = max(1, min(12, round(min(right - left, bottom - top) * 0.04)))
+    # Keep the smaller analysis neighborhood for transparency removal, where
+    # nearby visible components determine whether an object can simply clear.
+    feather = (removal_transition_width(core.crop(bounds)) if opaque
+               else max(1, min(12, round(min(right - left, bottom - top) * 0.04))))
     area = (max(0, left - feather), max(0, top - feather),
             min(size[0], right + feather), min(size[1], bottom + feather))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * feather + 1, 2 * feather + 1))
-    expanded = Image.fromarray(cv2.dilate(np.asarray(core.crop(area)), kernel))
+    expanded = _expand_mask(core.crop(area), feather)
     footprint = Image.new("L", size)
-    footprint.paste(ImageChops.subtract(expanded, protected.crop(area)), area[:2])
+    blocked = protected.crop(area)
+    if object_limit is not None:
+        allowed = object_limit.crop(area)
+        if effects:
+            effect_mask = Image.new("L", allowed.size)
+            for target in effects.values():
+                x, y = target.origin
+                _union_target(effect_mask, replace(target, origin=(x - area[0], y - area[1])))
+            effect_mask = ImageChops.darker(effect_mask, core.crop(area))
+            allowed = ImageChops.lighter(allowed, _expand_mask(effect_mask, feather))
+        blocked = ImageChops.lighter(blocked, ImageChops.invert(allowed))
+    if not opaque and source is not None and source.mode == "RGBA":
+        # The blend can reach clear pixels. Keep visible pixels outside the approved shapes.
+        outside_objects = ImageChops.invert(core.crop(area))
+        visible = source.crop(area).getchannel("A").point(_BINARY)
+        blocked = ImageChops.lighter(blocked, ImageChops.darker(outside_objects, visible))
+    footprint.paste(ImageChops.subtract(expanded, blocked), area[:2])
     labels = []
-    for target in selected:
-        x, y = target.origin
-        overlap = core.crop((x, y, x + target.mask.width, y + target.mask.height))
-        if ImageChops.darker(overlap, target.mask).getbbox() is not None:
+    for index, target in enumerate(targets):
+        if index in objects:
             labels.append(target.label)
-    return core, footprint, tuple(labels)
+        elif index in effects and ImageChops.darker(core.crop(_target_bounds(target)), target.mask).getbbox() is not None:
+            labels.append(target.label)
+    return RemovalInputs(core, footprint, tuple(labels), tuple(objects.values()), manual is not None, excluded=excluded)
 
 
 def _outline(mask: Image.Image, origin: tuple[int, int] = (0, 0)) -> QPainterPath:
@@ -102,32 +198,36 @@ def _outline(mask: Image.Image, origin: tuple[int, int] = (0, 0)) -> QPainterPat
 
 class RemoveEditor(FillEditor):
     detect_requested = Signal()
-    semantic_detection_requested = Signal()
 
     def __init__(self, base: Image.Image, *, mask: Image.Image | None = None):
         super().__init__(base, mask=mask, layered=True)
         self._original_mask: Image.Image | None = None
         self._targets: tuple[RemovalTarget, ...] = ()
         self._manual_mask: Image.Image | None = None
-        self._added: Image.Image | None = None
         self._excluded: Image.Image | None = None
-        self._inputs: tuple[Image.Image, Image.Image, tuple[str, ...]] | None = None
+        self._inputs: RemovalInputs | None = None
         self._detection_points: tuple[tuple[int, int], ...] = ()
         self._click_start: QPointF | None = None
         self._detailed = False
-        self._detecting = False
         self._has_extension = False
+        self._detecting = False
+        self._background_variants: dict[int, FillPreview] = {}
+        self._background = QPushButton("Background")
+        self._background.setCheckable(True)
+        self._background.clicked.connect(self._show_preview)
+        self._compare.addButton(self._background)
+        self._review.layout().insertWidget(1, self._background)
         self._prompt.hide()
         self._alpha.hide()
         self._destination.hide()
         self._cancel.setText("Cancel")
 
         actions = QHBoxLayout()
-        self._detect = QPushButton("Detect objects")
+        self._detect = QPushButton("Select with Codex")
         self._detect.setProperty("primary", True)
         self._detect.clicked.connect(self.detect_requested)
         actions.addWidget(self._detect)
-        self._manual = QPushButton("Use selection manually")
+        self._manual = QPushButton("Use Lasso directly")
         self._manual.clicked.connect(self._use_manual)
         actions.addWidget(self._manual)
         self._change_selection = QPushButton("Change selection")
@@ -136,9 +236,9 @@ class RemoveEditor(FillEditor):
         self._refine = QPushButton("Refine selection")
         self._refine.clicked.connect(self._open_refinement)
         actions.addWidget(self._refine)
-        self._detect_effects = QPushButton("Detect objects and effects")
-        self._detect_effects.clicked.connect(self.semantic_detection_requested)
-        actions.addWidget(self._detect_effects)
+        self._redetect = QPushButton("Regenerate selection")
+        self._redetect.clicked.connect(self.detect_requested)
+        actions.addWidget(self._redetect)
         actions.addStretch()
 
         self._target_list = QListWidget()
@@ -171,10 +271,14 @@ class RemoveEditor(FillEditor):
             self._shapes.clear()
             self._shapes.addItem("Click", "click")
             self._shapes.addItem("Lasso", "lasso")
+            self._shapes.addItem("Direct Lasso", "direct-lasso")
             self._shapes.setCurrentIndex(1 if self._bounds else 0)
         self._shapes.currentIndexChanged.connect(self._change_selection_tool)
         self._canvas.set_tool(self._shapes.currentData())
-        self._canvas.setToolTip("Click an object or choose Lasso to draw around it. Scroll to zoom. Hold Space or use the middle button to pan.")
+        self._canvas.setToolTip(
+            "Click or draw a lasso to ask Codex for a selection. Direct Lasso uses your mark for the cutout "
+            "and can repair associated shadows or reflections outside it. Scroll to zoom."
+        )
         self._canvas.pointer_started.connect(self._begin_click)
         self._canvas.pointer_finished.connect(self._finish_click)
         self._show_before()
@@ -198,19 +302,24 @@ class RemoveEditor(FillEditor):
     def can_generate(self) -> bool:
         return getattr(self, "_inputs", None) is not None
 
-    def removal_inputs(self) -> tuple[Image.Image, Image.Image, tuple[str, ...]] | None:
+    def removal_inputs(self) -> RemovalInputs | None:
         return self._inputs
 
     def set_targets(self, targets: tuple[RemovalTarget, ...], *, detailed: bool = False):
-        if not any(not target.protected for target in targets):
+        if not any(target.parent is None and not target.protected for target in targets):
             if self._original_mask is not None:
-                message = "No additional objects or effects detected. You can refine the marked area manually."
+                message = "Codex found no replacement selection. You can keep editing the current area."
             elif self._detection_points:
                 message = "No objects detected. Click a different spot or use Lasso to mark the object."
             else:
-                message = "No objects detected. Adjust the lasso or use the selection manually."
+                message = "Codex found no object. Adjust the lasso or use it directly."
             self.set_message(message)
             return
+        if self._manual_mask is not None and self._inputs is not None:
+            # Keep the adjusted Direct Lasso as the guide when moving to object review.
+            self._original_mask = self._inputs.core
+            with QSignalBlocker(self._shapes):
+                self._shapes.setCurrentIndex(self._shapes.findData("lasso"))
         requires_review = len(targets) > 1 or not targets[0].selected or targets[0].parent is not None
         self._start_review(targets, detailed=detailed or requires_review or self._detailed)
 
@@ -221,6 +330,7 @@ class RemoveEditor(FillEditor):
         )
 
     def _change_selection_tool(self):
+        self._canvas.set_tool("click" if self._shapes.currentData() == "click" else "lasso")
         self._detection_points = ()
         self._mask = Image.new("L", self._source.size)
         self._bounds = None
@@ -272,8 +382,9 @@ class RemoveEditor(FillEditor):
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(Qt.CheckState.Checked if target.selected else Qt.CheckState.Unchecked)
                 self._target_list.addItem(item)
-            if self._target_list.count():
-                self._target_list.setCurrentRow(0)
+            if targets:
+                first_checked = next((i for i, target in enumerate(targets) if target.selected and not target.protected), 0)
+                self._target_list.setCurrentRow(first_checked)
         self._targets_changed()
 
     def _open_refinement(self):
@@ -286,7 +397,7 @@ class RemoveEditor(FillEditor):
     def _reset_detection(self):
         self._mask = self.detection_mask
         self._bounds = self._mask.getbbox()
-        self._original_mask = self._manual_mask = self._added = self._excluded = None
+        self._original_mask = self._manual_mask = self._excluded = None
         self._targets = ()
         self._inputs = None
         self._detailed = False
@@ -295,7 +406,7 @@ class RemoveEditor(FillEditor):
             self._target_list.clear()
         self._select_operation("new")
         self._mode_buttons["new"].setChecked(True)
-        self._canvas.set_tool(self._shapes.currentData())
+        self._canvas.set_tool("click" if self._shapes.currentData() == "click" else "lasso")
         self._canvas.set_selection(self._mask, self._bounds)
         self._draft_changed()
 
@@ -305,21 +416,23 @@ class RemoveEditor(FillEditor):
             item.data(Qt.ItemDataRole.UserRole) for item in items
             if item.flags() & Qt.ItemFlag.ItemIsUserCheckable and item.checkState() == Qt.CheckState.Checked
         }
+        self._inputs = removal_masks(
+            self._source.size, self._targets, checked, manual=self._manual_mask, excluded=self._excluded,
+            opaque=self._source.mode == "RGB", source=self._source,
+        )
+        active_objects = {id(target) for target in self._inputs.objects} if self._inputs is not None else set()
         with QSignalBlocker(self._target_list):
             for item in items:
                 target = self._targets[item.data(Qt.ItemDataRole.UserRole)]
-                enabled = target.parent is None or target.parent in checked
+                enabled = target.parent is None or id(self._targets[target.parent]) in active_objects
                 flags = item.flags()
                 item.setFlags(flags | Qt.ItemFlag.ItemIsEnabled if enabled else flags & ~Qt.ItemFlag.ItemIsEnabled)
-        self._inputs = removal_masks(
-            self._source.size, self._targets, checked, manual=self._manual_mask, added=self._added, excluded=self._excluded,
-        )
         if self._inputs is not None and self._source.mode == "RGBA":
-            core = self._inputs[0]
+            core = self._inputs.core
             bounds = core.getbbox()
             if bounds is not None and not selection_has_visible_pixels(self._source, core, bounds):
                 self._inputs = None
-        self._mask = self._inputs[1] if self._inputs is not None else Image.new("L", self._source.size)
+        self._mask = self._inputs.footprint if self._inputs is not None else Image.new("L", self._source.size)
         self._bounds = self._mask.getbbox()
         self._canvas.set_selection(self._mask, self._bounds)
         self._removal_outline.setPath(_outline(self._mask))
@@ -350,40 +463,80 @@ class RemoveEditor(FillEditor):
     def _focus_target(self, item, *_):
         if item is None:
             self._target_outline.setPath(QPainterPath())
+            self._refresh()
             return
         target = self._targets[item.data(Qt.ItemDataRole.UserRole)]
         pen = QPen(QColor("#ffe6a7" if target.protected else "#edf1f7"), 1.5, Qt.PenStyle.DashLine)
         pen.setCosmetic(True)
         self._target_outline.setPen(pen)
         self._target_outline.setPath(_outline(target.mask, target.origin))
+        self._refresh()
+
+    def _focused_checked_target(self) -> int | None:
+        item = self._target_list.currentItem()
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+        if item is not None and item.flags() & flags == flags and item.checkState() == Qt.CheckState.Checked:
+            return item.data(Qt.ItemDataRole.UserRole)
+        return None
 
     def _apply_lasso(self, path: QPainterPath):
         if self._original_mask is None:
             previous = self._mask
             super()._apply_lasso(path)
             if self._mask is not previous and self.can_detect:
-                self.detect_requested.emit()
+                if self._shapes.currentData() == "direct-lasso":
+                    self._use_manual()
+                else:
+                    self.detect_requested.emit()
             return
-        if not self._detailed:
+        if not self._detailed or self._busy:
+            return
+        target_index = self._focused_checked_target()
+        if self._operation == "add" and self._manual_mask is None and target_index is None:
             return
         stroke = combine_selection(None, path, self._source.size, "new")
         if stroke is None:
             return
         if self._operation == "subtract":
             self._excluded = stroke if self._excluded is None else ImageChops.lighter(self._excluded, stroke)
-            if self._added is not None:
-                self._added = ImageChops.subtract(self._added, stroke.point(_BINARY))
+        elif self._manual_mask is not None:
+            self._manual_mask = ImageChops.lighter(self._manual_mask, stroke)
         else:
-            self._added = stroke if self._added is None else ImageChops.lighter(self._added, stroke)
-            if self._excluded is not None:
-                self._excluded = ImageChops.subtract(self._excluded, stroke.point(_BINARY))
+            assert target_index is not None
+            target = self._targets[target_index]
+            x, y = target.origin
+            left, top, right, bottom = stroke.getbbox()
+            area = min(left, x), min(top, y), max(right, x + target.mask.width), max(bottom, y + target.mask.height)
+            extended = stroke.crop(area)
+            _union_target(extended, replace(target, origin=(x - area[0], y - area[1])))
+            updated = replace(target, mask=extended, origin=area[:2])
+            self._targets = self._targets[:target_index] + (updated,) + self._targets[target_index + 1:]
         self._targets_changed()
 
+    def add_removal_variant(self, after: FillPreview, background: FillPreview):
+        self._background_variants[len(self._variants)] = background
+        self.add_variant(after)
+
+    def clear_variants(self):
+        self._background_variants.clear()
+        super().clear_variants()
+
+    def _select_generated_view(self):
+        if self.selected_variant in self._background_variants:
+            self._background.setChecked(True)
+        else:
+            super()._select_generated_view()
+
     def _show_preview(self):
-        super()._show_preview()
+        index = self.selected_variant
+        background = self._background_variants.get(index) if index is not None else None
+        if background is not None and self._background.isChecked():
+            self._display_preview(background)
+        else:
+            super()._show_preview()
         if not hasattr(self, "_extension"):
             return
-        visible = self._original_mask is not None and not (self._after.isChecked() and self.selected_variant is not None)
+        visible = self._original_mask is not None and (self._before.isChecked() or index is None)
         for overlay in (self._extension, self._lasso_outline, self._removal_outline):
             overlay.setVisible(visible)
         self._target_outline.setVisible(visible and self._detailed)
@@ -393,6 +546,10 @@ class RemoveEditor(FillEditor):
         self._detecting = busy and detecting
         super().set_busy(busy, generating=generating or detecting)
 
+    def _select_operation(self, operation: str):
+        super()._select_operation(operation)
+        self._refresh()
+
     def _refresh(self):
         super()._refresh()
         if not hasattr(self, "_detect"):
@@ -400,37 +557,49 @@ class RemoveEditor(FillEditor):
         reviewing = self._original_mask is not None
         selected = self._bounds is not None or bool(self._detection_points)
         can_detect = self.can_detect
-        show_manual = not reviewing and self._shapes.currentData() == "lasso"
+        tool = self._shapes.currentData()
+        show_detect = not reviewing and tool != "direct-lasso"
+        show_manual = tool == "lasso" and self._manual_mask is None
         self._controls.setVisible(selected or reviewing or self._generating)
         self._target_list.setVisible(reviewing and self._detailed and self._target_list.count() > 0)
         self._target_list.setEnabled(not self._busy)
-        self._detect.setVisible(not reviewing)
-        self._detect.setEnabled(not self._busy and not reviewing and can_detect)
+        self._detect.setVisible(show_detect)
+        self._detect.setEnabled(not self._busy and show_detect and can_detect)
         self._manual.setVisible(show_manual)
-        self._manual.setEnabled(not self._busy and show_manual and can_detect)
+        self._manual.setEnabled(not self._busy and show_manual and self._can_detect_lasso())
         self._change_selection.setVisible(reviewing)
         self._change_selection.setEnabled(not self._busy)
         self._refine.setVisible(reviewing and not self._detailed)
         self._refine.setEnabled(not self._busy)
-        self._detect_effects.setVisible(reviewing and self._detailed and bool(self._targets))
-        self._detect_effects.setEnabled(not self._busy and can_detect)
+        direct = self._manual_mask is not None
+        self._redetect.setText("Review with Lasso" if direct else "Regenerate selection")
+        self._redetect.setVisible(reviewing and self._detailed and (direct or bool(self._targets)))
+        self._redetect.setEnabled(not self._busy and (self.can_generate if direct else can_detect))
         self._shapes.setVisible(not reviewing)
         self._mode_buttons["new"].hide()
         for mode in ("add", "subtract"):
             self._mode_buttons[mode].setVisible(reviewing and self._detailed)
-        self._canvas.set_drawing_enabled(not self._busy and (not reviewing or self._detailed))
+        self._mode_buttons["add"].setEnabled(not self._busy and (direct or self._focused_checked_target() is not None))
+        can_refine = self._detailed and (self._operation == "subtract" or self._mode_buttons["add"].isEnabled())
+        self._canvas.set_drawing_enabled(not self._busy and (not reviewing or can_refine))
+        self._background.setEnabled(self.selected_variant in self._background_variants)
         self._generate.setVisible(reviewing)
         self._generate.setText("Generate another" if self._variants else "Remove")
         if self._generating:
-            self._status.setText("Detecting objects…" if self._detecting or not reviewing else "Reconstructing the background…")
-            self._status.show()
+            if self._detecting:
+                message = "Selecting with Codex…"
+            elif direct:
+                message = self._message
+            else:
+                message = "Reconstructing the background…"
+            self._status.setText(message)
+            self._status.setVisible(bool(message))
             return
         if self._message:
             return
         variant = self.selected_variant
         if variant is not None:
-            warning = self._variants[variant].warning
-            message = warning if self.can_apply else f"This variation is already applied. {warning}".strip()
+            message = self._variants[variant].warning or "Review the background. Apply keeps each object visible on its own layer."
         elif reviewing:
             if not self.can_generate:
                 message = "Choose at least one object or add an area to remove."
@@ -440,9 +609,11 @@ class RemoveEditor(FillEditor):
                 message = "Review the marked area before removing."
         elif selected and not can_detect:
             message = "Select a visible object to remove."
-        elif self._shapes.currentData() == "click":
-            message = "Click the object you want to remove, or choose Lasso to draw around it."
-        else:
+        elif tool == "click":
+            message = "Click an object to have Codex trace its selection."
+        elif tool == "direct-lasso":
             message = "Draw around the objects you want to remove."
+        else:
+            message = "Draw around the objects you want Codex to trace."
         self._status.setText(message)
         self._status.setVisible(bool(message))
