@@ -551,6 +551,50 @@ def test_color_adjustments_preview_cancel_and_undo(window):
     assert editor.document is original
 
 
+@pytest.mark.parametrize("active_layer", [False, True])
+def test_fill_reuses_selected_variation_when_subtracting(window, monkeypatch, active_layer):
+    document = desktop.Document.from_image(Image.new("RGB", (160, 128), "red"), "base")
+    window._show_document(document)
+    calls = []
+
+    def generate(base, mask, prompt, edit_alpha, _exe, *, cancelled):
+        calls.append(mask.getbbox())
+        color = "blue" if len(calls) == 1 else "green"
+        return FillCandidate(Image.new(base.mode, (160, 160), color), {
+            "crop": [0, 0, 160, 160], "shift": [0, 0], "color": [0, 0, 0], "feather": 1,
+        })
+
+    monkeypatch.setattr(window, "_codex_resolver", lambda: lambda: Path("mock-codex.exe"))
+    monkeypatch.setattr(desktop, "generate_fill", generate)
+    window.editor.fill_button.click()
+    idle(window)
+    fill = window.layer_fill.editor
+    if active_layer:
+        fill._destination.setCurrentIndex(1)
+    fill._shapes.setCurrentIndex(fill._shapes.findData("rectangle"))
+    gesture(fill._canvas, (20, 20), (140, 108))
+    for _ in range(2):
+        fill._generate.click()
+        idle(window)
+    fill._chooser.setCurrentIndex(0)
+    fill._mode_buttons["subtract"].click()
+    gesture(fill._canvas, (96, 8), (152, 120))
+    idle(window)
+
+    assert len(calls) == 2 and fill.can_apply and fill._chooser.count() == 1
+    variant = window.layer_fill.variants[0]
+    pixels = render(variant.document)
+    assert pixels.getpixel((64, 64)) == (0, 0, 255, 255)
+    assert pixels.getpixel((120, 64)) == (255, 0, 0, 255)
+    assert fill._after.isChecked()
+
+    fill._mode_buttons["add"].click()
+    gesture(fill._canvas, (96, 20), (130, 108))
+    assert len(calls) == 2 and not fill.can_apply and window.task is None
+    fill._discard.click()
+    assert window.editor.document is document
+
+
 def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
     editor = window.editor
     window._show_document(desktop.Document.from_image(Image.new("RGB", (96, 80), "red"), "base"))

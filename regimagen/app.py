@@ -26,7 +26,7 @@ from .composite import export_parts, export_png
 from .document import Document, Layer, box, export_document, render
 from .document_fill import (
     ActiveFillTarget, LayeredVariant, RemovalVariant, active_fill_target, fill_reference, layered_variant,
-    removal_variant, removed_object_layers, replacement_layer,
+    removal_variant, removed_object_layers, render_layer_fill, replacement_layer,
 )
 from .editor import Editor, dimensions
 from .files import atomic_output, load_source
@@ -725,7 +725,7 @@ class Window(QMainWindow):
             if isinstance(session, RemoveSession):
                 editor.changed.connect(session.clear_variants)
             else:
-                editor.changed.connect(session.variants.clear)
+                editor.changed.connect(self._layer_fill_changed)
             self.stack.addWidget(editor)
             self.stack.setCurrentWidget(editor)
 
@@ -1043,6 +1043,26 @@ class Window(QMainWindow):
 
             self._launch("preview_fill", render, self._append_fill_variant, message="Preparing saved variation…")
 
+    def _layer_fill_changed(self, reuse_variant: int | None):
+        session = self.layer_fill
+        if session is None:
+            return
+        candidate = None
+        if reuse_variant is not None and 0 <= reuse_variant < len(session.variants):
+            candidate = session.variants[reuse_variant].candidate
+        session.variants.clear()
+        editor = session.editor
+        if candidate is None or self.task is not None or not editor.can_generate:
+            return
+        image, mask = editor.generation_input()
+        target = session.target if editor.to_active_layer else None
+        edit_alpha = editor.edit_alpha
+
+        def render(*_):
+            return render_layer_fill(session.document, image, mask, candidate, target, edit_alpha=edit_alpha)
+
+        self._launch("preview_fill", render, self._append_layer_variant, message="Updating variation…")
+
     def _generate_fill(self):
         layered = self.layer_fill
         session = layered or self.fill
@@ -1058,12 +1078,10 @@ class Window(QMainWindow):
 
         def generate(_update, _pause, cancel):
             candidate = generate_fill(image, mask, prompt, edit_alpha, executable(), cancelled=cancel)
-            isolated_layer = layered is not None and target is None and candidate.transparent_background
-            preview = render_fill(image, mask, candidate, edit_alpha=edit_alpha, isolated_layer=isolated_layer)
-            result = (
-                (candidate, preview) if layered is None
-                else layered_variant(layered.document, mask, preview, target, isolated_layer=isolated_layer)
-            )
+            if layered is None:
+                result = candidate, render_fill(image, mask, candidate, edit_alpha=edit_alpha)
+            else:
+                result = render_layer_fill(layered.document, image, mask, candidate, target, edit_alpha=edit_alpha)
             if cancel.is_set():
                 raise Cancelled("Generation canceled.")
             return result

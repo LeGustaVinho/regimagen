@@ -7,7 +7,7 @@ from PIL import Image, ImageChops
 
 from .codex import Cancelled
 from .document import Document, Layer, box, paste_pixels, render
-from .fill import FillPreview
+from .fill import FillCandidate, FillPreview, render_fill
 from .geometry import Rect
 from .remove_detection import RemovalTarget
 
@@ -39,6 +39,7 @@ class LayeredVariant:
     document: Document
     layer_id: str
     preview: FillPreview
+    candidate: FillCandidate | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -131,3 +132,12 @@ def layered_variant(
         document = document.update(layer)
     composed = render(document, area)
     return LayeredVariant(document, layer.id, FillPreview(composed, (left, top), preview.warning))
+
+
+def render_layer_fill(
+    document: Document, image: Image.Image, selection: Image.Image, candidate: FillCandidate,
+    target: ActiveFillTarget | None, *, edit_alpha: bool,
+) -> LayeredVariant:
+    isolated = target is None and candidate.transparent_background
+    preview = render_fill(image, selection, candidate, edit_alpha=edit_alpha, isolated_layer=isolated)
+    return replace(layered_variant(document, selection, preview, target, isolated_layer=isolated), candidate=candidate)

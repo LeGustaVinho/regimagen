@@ -16,7 +16,7 @@ class FillEditor(QWidget):
     apply_requested = Signal()
     discard_requested = Signal()
     cancel_requested = Signal()
-    changed = Signal()
+    changed = Signal(object)
 
     def __init__(
         self, base: Image.Image, *, mask: Image.Image | None = None, prompt: str = "",
@@ -247,16 +247,17 @@ class FillEditor(QWidget):
         mask = combine_selection(self._mask, path, self._mask.size, self._operation)
         if mask is self._mask:
             return
+        reuse_variant = self.selected_variant if self._operation == "subtract" else None
         self._mask = mask
         self._bounds = mask.getbbox()
         self._canvas.set_selection(mask, self._bounds)
-        self._draft_changed()
+        self._draft_changed(reuse_variant=reuse_variant)
 
-    def _draft_changed(self):
+    def _draft_changed(self, *, reuse_variant: int | None = None):
         self._message = ""
         self._visible_selection = None
         self.clear_variants()
-        self.changed.emit()
+        self.changed.emit(reuse_variant)
 
     def _prompt_changed(self, text: str):
         value = text.strip()
