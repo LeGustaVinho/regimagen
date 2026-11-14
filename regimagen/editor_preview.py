@@ -17,6 +17,7 @@ from .codex import Cancelled
 from .document import RASTER_TILE_SIZE, Document, Layer, _adjust, render, sample_asset
 from .editor_tasks import EditorTask
 from .geometry import Rect
+from .periodic import periodic_pieces
 from .viewer import qimage
 
 PREVIEW_PIXELS = 1_000_000
@@ -231,6 +232,27 @@ def interactive_preview(document, region, tiles, cancelled, draft=None):
     return image
 
 
+def periodic_preview(document, region, draw, cancelled):
+    """Render only the visible portions of each repeated canvas."""
+    area = region.area
+    sx, sy = region.size[0] / area.width, region.size[1] / area.height
+    image = _surface(*region.size)
+    pieces = {}
+    with QPainter(image) as painter:
+        for part, (x, y) in periodic_pieces(area, document.size):
+            if cancelled():
+                raise Cancelled("Preview superseded.")
+            left, right = round(x * sx), round((x + part.width) * sx)
+            top, bottom = round(y * sy), round((y + part.height) * sy)
+            if left == right or top == bottom:
+                continue
+            source = PreviewRegion(part, (right - left, bottom - top), region.step)
+            if source not in pieces:
+                pieces[source] = draw(source)
+            painter.drawImage(left, top, pieces[source])
+    return image
+
+
 def _same_composition(first: Document, second: Document):
     return first.size == second.size and len(first.layers) == len(second.layers) and all(
         a is b or (
@@ -267,6 +289,7 @@ class EditorPreview(QObject):
         self._displayed = self._overview = self._before_draft = None
         self._interactive = self._exact = None
         self._interactive_due = self._exact_due = False
+        self._selection_visible = True
         self._last_frame_at = float("-inf")
         self._frame_timer = QTimer(self, singleShot=True, timerType=Qt.TimerType.PreciseTimer)
         self._frame_timer.timeout.connect(self._start_frame)
@@ -274,6 +297,17 @@ class EditorPreview(QObject):
         self._exact_timer.timeout.connect(self._exact_ready)
         canvas.moved.connect(self._camera_changed)
         canvas.resized.connect(self._camera_changed)
+
+    def set_pattern_preview(self, enabled):
+        if self.canvas.pattern_preview != enabled:
+            self._supersede()
+            self.shown = self._displayed = self._overview = self._before_draft = None
+            self.canvas.set_pattern_preview(enabled)
+            self.resume()
+
+    def set_selection_visible(self, visible):
+        self._selection_visible = visible
+        self.canvas.set_selection_visible(visible)
 
     def set_document(self, document, *, reset=False, keep_draft=False):
         previous = self.document
@@ -346,10 +380,14 @@ class EditorPreview(QObject):
         if self.document is None or not self.canvas.isVisible():
             return None
         visible = self.canvas.mapToScene(self.canvas.viewport().rect()).boundingRect()
+        bounds = self.document.bounds
+        if self.canvas.pattern_preview:
+            scene = self.canvas.sceneRect()
+            bounds = Rect(int(scene.left()), int(scene.top()), int(scene.right()), int(scene.bottom()))
         return Rect(
             math.floor(visible.left() - margin), math.floor(visible.top() - margin),
             math.ceil(visible.right() + margin), math.ceil(visible.bottom() + margin),
-        ).intersect(self.document.bounds)
+        ).intersect(bounds)
 
     def _viewport(self):
         zoom = self.canvas.transform().m11()
@@ -385,7 +423,7 @@ class EditorPreview(QObject):
         overview = not self._interactive_due
         self._interactive_due = False
         if overview:
-            if self._overview is not None or self._gesturing:
+            if self._overview is not None or self._gesturing or self.canvas.pattern_preview:
                 return
             area = self.document.bounds
             scale = self.canvas.fit_scale() * self.canvas.devicePixelRatioF()
@@ -393,7 +431,15 @@ class EditorPreview(QObject):
         request = _Request(self._epoch, region, overview)
         document, draft = self.document, self.draft
         tiles = self._tiles
-        task = EditorTask(lambda cancelled: interactive_preview(document, region, tiles, cancelled, draft))
+        repeats = self.canvas.pattern_preview
+
+        def render_frame(cancelled):
+            def draw(part):
+                return interactive_preview(document, part, tiles, cancelled, draft)
+
+            return periodic_preview(document, region, draw, cancelled) if repeats else draw(region)
+
+        task = EditorTask(render_frame)
         self._interactive = task, request
         self._last_frame_at = monotonic()
         task.signals.finished.connect(self._frame_finished, Qt.ConnectionType.QueuedConnection)
@@ -407,13 +453,15 @@ class EditorPreview(QObject):
                 self.show_error(error)
             elif image is not None:
                 frame = _Frame(request.region.area, QPixmap.fromImage(image))
-                if not self._gesturing and frame.area == self.document.bounds:
+                if not self.canvas.pattern_preview and not self._gesturing and frame.area == self.document.bounds:
                     self._overview = frame
                 if not request.overview and (self._gesturing or self.shown != self._exact_target()):
                     visible = self._visible()
                     if visible is not None and frame.area.intersect(visible) == visible:
                         self._show(frame)
-        if self._interactive_due or (not error and self._overview is None and not self._gesturing):
+        if self._interactive_due or (
+            not self.canvas.pattern_preview and not error and self._overview is None and not self._gesturing
+        ):
             self._schedule_frame()
 
     def _schedule_exact(self, delay):
@@ -447,7 +495,15 @@ class EditorPreview(QObject):
             return
         document, area, size = target
         region = PreviewRegion(area, size)
-        task = EditorTask(lambda cancelled: exact_preview(document, region, cancelled))
+        repeats = self.canvas.pattern_preview
+
+        def render_frame(cancelled):
+            def draw(part):
+                return exact_preview(document, part, cancelled)
+
+            return periodic_preview(document, region, draw, cancelled) if repeats else draw(region)
+
+        task = EditorTask(render_frame)
         self._exact = task, _Request(self._epoch, region)
         task.signals.finished.connect(self._exact_finished, Qt.ConnectionType.QueuedConnection)
         QThreadPool.globalInstance().start(task)
@@ -470,5 +526,6 @@ class EditorPreview(QObject):
         if frame is not self._displayed:
             self._displayed = frame
             area = frame.area
-            self.canvas.set_image(frame.pixmap, rect=QRectF(area.left, area.top, area.width, area.height))
+            self.canvas.set_image(frame.pixmap, selection_visible=self._selection_visible,
+                                  rect=QRectF(area.left, area.top, area.width, area.height))
         self.shown = (self.document, frame.area, frame.exact_size) if frame.exact_size is not None else None

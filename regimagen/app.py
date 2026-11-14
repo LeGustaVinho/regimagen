@@ -2,18 +2,18 @@
 
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from hashlib import file_digest
 from pathlib import Path
 from shutil import copyfileobj
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 from threading import Event
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw
-from PySide6.QtCore import QPointF, QRectF, QSettings, QSignalBlocker, QThread, Qt, Signal
-from PySide6.QtGui import QColor, QFontDatabase, QIcon, QPainter, QPalette, QPen, QPixmap
+from PIL import Image, ImageChops
+from PySide6.QtCore import QPointF, QRectF, QSettings, QSignalBlocker, QThread, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractScrollArea, QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
@@ -21,10 +21,13 @@ from PySide6.QtWidgets import (
     QStyle, QToolTip, QVBoxLayout, QWidget,
 )
 
-from .codex import Cancelled, CodexError, find_codex
+from .codex import AuthRequired, Cancelled, CodexError, QuotaPaused, find_codex
 from .composite import export_parts, export_png
-from .document import Document, box, export_document, render
-from .document_fill import ActiveFillTarget, LayeredVariant, active_fill_target, fill_reference, layered_variant
+from .document import Document, Layer, box, export_document, render
+from .document_fill import (
+    ActiveFillTarget, LayeredVariant, RemovalVariant, active_fill_target, fill_reference, layered_variant,
+    removal_variant, removed_object_layers, replacement_layer,
+)
 from .editor import Editor, dimensions
 from .files import atomic_output, load_source
 from .fill import FillCandidate, FillPreview, generate_fill, generate_remove, render_fill, render_remove
@@ -32,10 +35,13 @@ from .fill_editor import FillEditor
 from .geometry import (
     DEFAULT_SCALES, MAX_PNG_DIMENSION, MIN_COLUMNS, MIN_ROWS, Cell, Grid, Layout, plan_scales, suggested_grid,
 )
-from .jobs import load_job_input, pending_cells, refresh_thumbnails, run_scale_batch, run_tiles
+from .jobs import RunOutcome, load_job_input, pending_cells, refresh_thumbnails, run_scale_batch, run_tiles
+from .pattern import check_pattern_joins, detect_pattern_seams, repair_pattern
+from .pattern_editor import PatternEditor, PatternSession, PatternVariant
+from .periodic import wrap_offset
 from .project import PROJECT_SUFFIX, load_project, save_project
-from .remove_detection import detect_removal, segment_removal_click, segment_removal_lasso
-from .remove_editor import RemoveEditor
+from .remove_detection import detect_removal, detect_removal_effects
+from .remove_editor import RemovalInputs, RemoveEditor
 from .storage import FillEdit, Job, Snapshot, Source, Store, Tile
 from .viewer import Comparison, qimage
 
@@ -63,7 +69,7 @@ def logo(size=48) -> QPixmap:
 class Task(QThread):
     updated = Signal(object)
     succeeded = Signal(object)
-    failed = Signal(str)
+    failed = Signal(object)
 
     def __init__(self, operation, parent):
         super().__init__(parent)
@@ -74,10 +80,8 @@ class Task(QThread):
     def run(self):
         try:
             self.succeeded.emit(self.operation(self.updated.emit, self.pause, self.cancelled))
-        except Cancelled:
-            self.succeeded.emit(None)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(exc)
 
 
 @dataclass
@@ -108,6 +112,44 @@ class LayerFillSession:
     target: ActiveFillTarget | None
     variants: list[LayeredVariant] = field(default_factory=list)
     applying: bool = False
+
+
+@dataclass
+class RemoveSession(LayerFillSession):
+    prepared: tuple[RemovalInputs, tuple[Layer, ...]] | None = None
+
+    def clear_variants(self):
+        self.variants.clear()
+        self.prepared = None
+
+
+@dataclass
+class ScaleBatch:
+    source: Source
+    layouts: tuple[Layout, ...]
+    parent: Path
+    prompt: str
+    job: Job | None
+    grid: Grid
+    folder: Path | None = None
+    published: dict[int, tuple[str, str]] = field(default_factory=dict)
+    completed: int = 0
+
+
+def quota_reset_text(reset: int | None) -> str | None:
+    if reset is None:
+        return None
+    try:
+        return f"{datetime.fromtimestamp(reset):%Y-%m-%d %H:%M}"
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def quota_message(reset: int | None, action: str) -> str:
+    timestamp = quota_reset_text(reset)
+    if timestamp is None:
+        return f"Codex usage limit reached. {action} when the limit resets."
+    return f"Codex usage limit reached. {action} after {timestamp}."
 
 
 def tile_state(tile: Tile) -> tuple[str, str]:
@@ -260,6 +302,7 @@ class Window(QMainWindow):
         self.sprite = None
         self.fill: FillSession | None = None
         self.layer_fill: LayerFillSession | None = None
+        self.pattern: PatternSession | None = None
         self.applied_fill: FillEdit | None = None
         self.project_path: Path | None = None
         self.selected: Cell | None = None
@@ -269,7 +312,8 @@ class Window(QMainWindow):
         self._editor_actions = deque()
         self.operation = ""
         self.closing = False
-        self.export_message = ""
+        self.scale_batch: ScaleBatch | None = None
+        self.output_folder: Path | None = None
         self.setWindowTitle("Regimagen")
         self.setWindowIcon(QIcon(logo()))
         self.setAcceptDrops(True)
@@ -324,6 +368,18 @@ class Window(QMainWindow):
         self.open_button.setMenu(file_menu)
         self.addActions(file_menu.actions())
         toolbar.addWidget(self.open_button)
+        self.view_button = QPushButton("View")
+        view_menu = QMenu(self.view_button)
+        self.pattern_preview_action = view_menu.addAction("Pattern Preview")
+        self.pattern_preview_action.setCheckable(True)
+        self.view_button.setMenu(view_menu)
+        toolbar.addWidget(self.view_button)
+        self.filter_button = QPushButton("Filter")
+        filter_menu = QMenu(self.filter_button)
+        self.offset_action = filter_menu.addMenu("Other").addAction("Offset…")
+        self.fix_seams_action = filter_menu.addAction("Fix Pattern Seams…", self._open_pattern)
+        self.filter_button.setMenu(filter_menu)
+        toolbar.addWidget(self.filter_button)
         self.history = QComboBox()
         self.history.setMinimumContentsLength(17)
         self.history.setMaximumWidth(255)
@@ -364,6 +420,9 @@ class Window(QMainWindow):
         self.stack.addWidget(self.comparison)
         workspace.addWidget(self.stack, 1)
         self.editor = Editor()
+        self.pattern_preview_action.toggled.connect(self.editor.set_pattern_preview)
+        self.offset_action.triggered.connect(self.editor.offset_layer)
+        self.editor.layers.currentItemChanged.connect(lambda *_: self._refresh_pattern_actions())
         self.editor.changed.connect(self._refresh)
         self.editor.import_requested.connect(self._import_layer)
         self.editor.reconstruct_requested.connect(self._reconstruct)
@@ -373,6 +432,34 @@ class Window(QMainWindow):
         self.sidebar = self._sidebar()
         workspace.addWidget(self.sidebar)
         shell.addLayout(workspace, 1)
+        shell.addWidget(self._footer())
+        self.stack.currentChanged.connect(self._clear_idle_feedback)
+        self.editor.undo.indexChanged.connect(self._clear_idle_feedback)
+
+    def _footer(self) -> QFrame:
+        footer = QFrame()
+        footer.setObjectName("taskFooter")
+        footer.setMinimumHeight(42)
+        row = QHBoxLayout(footer)
+        row.setContentsMargins(18, 4, 18, 4)
+        row.setSpacing(12)
+        self.task_status = QLabel()
+        self.task_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.task_status.setWordWrap(True)
+        self.task_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(self.task_status, 1)
+        self.task_progress = QProgressBar()
+        self.task_progress.setAccessibleName("Task progress")
+        self.task_progress.setTextVisible(False)
+        self.task_progress.setFixedSize(128, 6)
+        self.task_progress.hide()
+        row.addWidget(self.task_progress)
+        self.open_folder = QPushButton("Open folder")
+        self.open_folder.setObjectName("openOutputFolder")
+        self.open_folder.clicked.connect(self._open_output_folder)
+        self.open_folder.hide()
+        row.addWidget(self.open_folder)
+        return footer
 
     def _empty(self) -> QFrame:
         panel = QFrame()
@@ -530,7 +617,7 @@ class Window(QMainWindow):
 
     def _load_history(self, index: int):
         item: Path | Job | Source | None = self.history.itemData(index)
-        if item is None or self.task is not None or self.fill is not None or self.layer_fill is not None:
+        if item is None or not self._can_open():
             return
         if isinstance(item, Path):
             with QSignalBlocker(self.history):
@@ -548,7 +635,7 @@ class Window(QMainWindow):
             refresh_thumbnails(self.store, item, alpha=sprite, cancelled=cancel.is_set)
             return item.source, qimage(np.asarray(image)), item.grid, sprite, item
 
-        self._launch("import", load, self._show_source)
+        self._launch("import", load, self._show_source, message="Opening image…")
 
     def _open_fill(self, *, reopen=False):
         if self.source is None or self.stack.currentWidget() is not self.comparison or self.task is not None:
@@ -575,7 +662,7 @@ class Window(QMainWindow):
                         candidate = FillCandidate(saved.copy(), previous.metadata)
                     warning = previous.metadata.get("preview_warning", "")
                     with Image.open(previous.source.path, formats=("PNG",)) as saved:
-                        if saved.size != image.size or saved.mode != image.mode:
+                        if saved.size != image.size or saved.mode != candidate.image.mode:
                             raise ValueError("The saved fill does not match the base image.")
                         preview = FillPreview(saved.crop(bounds), bounds[:2], warning)
             return image, sha256, mask, candidate, preview
@@ -602,7 +689,7 @@ class Window(QMainWindow):
             elif previous is not None:
                 editor.set_message("The base image changed. Generate a new variation to apply this selection.")
 
-        self._launch("open_fill", load, show)
+        self._launch("open_fill", load, show, message="Opening Generative Fill…")
 
     def _open_layer_fill(self, *, remove=False):
         if self.task is not None or self.stack.currentWidget() is not self.editor:
@@ -625,25 +712,144 @@ class Window(QMainWindow):
             if remove:
                 editor = RemoveEditor(image, mask=selection)
                 editor.detect_requested.connect(self._detect_remove)
-                editor.semantic_detection_requested.connect(lambda: self._detect_remove(semantic=True))
                 editor.generate_requested.connect(self._generate_remove)
             else:
                 editor = FillEditor(image, mask=selection, layered=True, active_target=active)
                 editor.generate_requested.connect(self._generate_fill)
             editor.set_busy(True)
-            session = self.layer_fill = LayerFillSession(document, editor, target)
+            session_type = RemoveSession if remove else LayerFillSession
+            session = self.layer_fill = session_type(document, editor, target)
             editor.cancel_requested.connect(self._cancel_fill)
             editor.apply_requested.connect(self._apply_layer_fill)
             editor.discard_requested.connect(self._close_layer_fill)
-            editor.changed.connect(session.variants.clear)
+            if isinstance(session, RemoveSession):
+                editor.changed.connect(session.clear_variants)
+            else:
+                editor.changed.connect(session.variants.clear)
             self.stack.addWidget(editor)
             self.stack.setCurrentWidget(editor)
 
-        self._launch("open_fill", load, show)
+        name = "Generative Remove" if remove else "Generative Fill"
+        self._launch("open_fill", load, show, message=f"Opening {name}…")
+
+    def _open_pattern(self):
+        if not self._can_open() or self.stack.currentWidget() is not self.editor:
+            return
+        if self._after_editor_edits(self._open_pattern):
+            return
+        document = self.editor.document
+        if document is None:
+            return
+        self.editor.canvas.cancel_gesture()
+        offset = tuple(extent // 2 for extent in document.size)
+
+        def load(_update, _pause, cancel):
+            composition = render(document, cancelled=cancel.is_set)
+            if composition.getchannel("A").getbbox() is None:
+                raise ValueError("Add visible content to the canvas before repairing a pattern.")
+            original = fill_reference(composition)
+            shifted = wrap_offset(original, *offset)
+            pixels = shifted if shifted.mode == "RGBA" else shifted.convert("RGBA")
+            shifted_document = Document("Offset", *document.size, (Layer("Offset", pixels),))
+            return original, shifted, shifted_document
+
+        def show(images):
+            if self.closing or self.editor.document is not document:
+                return
+            original, shifted, shifted_document = images
+            editor = PatternEditor(document, shifted_document)
+            session = self.pattern = PatternSession(document, original, shifted, offset, editor)
+            editor.detect_requested.connect(self._detect_pattern)
+            editor.generate_requested.connect(self._generate_pattern)
+            editor.apply_requested.connect(self._apply_pattern)
+            editor.discard_requested.connect(self._close_pattern)
+            editor.cancel_requested.connect(self._request_cancel)
+            editor.changed.connect(session.variants.clear)
+            self.stack.addWidget(editor)
+            self.stack.setCurrentWidget(editor)
+            self._refresh()
+
+        self._launch("open_pattern", load, show, message="Opening pattern repair…")
+
+    def _detect_pattern(self):
+        session = self.pattern
+        if session is None or self.task is not None or session.document is not self.editor.document:
+            return
+        executable = self._codex_resolver()
+
+        def detect(_update, _pause, cancel):
+            return detect_pattern_seams(session.original, session.shifted, session.offset, executable(), cancelled=cancel)
+
+        def show(mask):
+            if self.pattern is session and not self.closing and not self.task.cancelled.is_set():
+                session.editor.show_detection(mask)
+
+        self._launch("detect_pattern", detect, show, message="Detecting pattern seams…")
+
+    def _generate_pattern(self):
+        session = self.pattern
+        if (session is None or self.task is not None or session.document is not self.editor.document
+                or not session.editor.can_generate):
+            return
+        mask = session.editor.mask
+        executable = self._codex_resolver()
+
+        def generate(update, _pause, cancel):
+            shifted, notes = repair_pattern(session.shifted, mask, executable(), cancelled=cancel,
+                                            progress=lambda done, total: update((done, total)))
+            dx, dy = session.offset
+            result = wrap_offset(shifted, -dx, -dy)
+            approved = wrap_offset(mask, -dx, -dy)
+            warnings = check_pattern_joins(result, cancelled=cancel)
+            bounds = approved.getbbox()
+            layer = replacement_layer(approved, result.crop(bounds), bounds[:2], "Pattern Seam Repair")
+            pixels = shifted if shifted.mode == "RGBA" else shifted.convert("RGBA")
+            shifted_document = Document("Repaired Offset", *session.document.size, (Layer("Repaired Offset", pixels),))
+            if cancel.is_set():
+                raise Cancelled("Pattern repair canceled.")
+            return PatternVariant(session.document.insert(layer), layer.id, shifted_document, warnings, notes)
+
+        def show(variant):
+            if (self.pattern is session and session.editor.mask is mask and not self.closing
+                    and not self.task.cancelled.is_set()):
+                session.variants.append(variant)
+                session.editor.add_variant(variant)
+
+        def progress(counts):
+            done, total = counts
+            label = f"Repairing pattern · {done}/{total} windows complete"
+            self._report_progress(label, counts)
+
+        self._launch("generate_pattern", generate, show, progress, message="Preparing pattern repair…")
+
+    def _apply_pattern(self):
+        session = self.pattern
+        if session is None or self.task is not None or session.document is not self.editor.document:
+            return
+        index = session.editor.selected_variant
+        if index is None:
+            return
+        variant = session.variants[index]
+        if self.editor.apply_pattern(variant.document, variant.layer_id, session.document):
+            self._close_pattern()
+            self.editor.canvas.setFocus()
+            self._set_feedback("Applied Pattern Seam Repair. Undo with Ctrl+Z.")
+        else:
+            session.editor.set_message("The document changed. Reopen pattern repair to use the current image.")
+
+    def _close_pattern(self):
+        if self.pattern is None or self.task is not None:
+            return
+        editor = self.pattern.editor
+        self.pattern = None
+        self.stack.setCurrentWidget(self.editor)
+        self.stack.removeWidget(editor)
+        editor.deleteLater()
+        self._refresh()
 
     def _remove_session(self):
         session = self.layer_fill
-        if self.task is not None or session is None or session.applying or not isinstance(session.editor, RemoveEditor):
+        if self.task is not None or not isinstance(session, RemoveSession) or session.applying:
             return None
         if session.document is not self.editor.document:
             self._close_layer_fill()
@@ -651,45 +857,40 @@ class Window(QMainWindow):
             return None
         return session
 
-    def _detect_remove(self, *, semantic=False):
+    def _detect_remove(self):
         session = self._remove_session()
         if session is None:
             return
         editor = session.editor
         image, _ = editor.generation_input()
         selection, points = editor.detection_mask, editor.detection_points
+        inputs = editor.removal_inputs()
+        if inputs is not None and inputs.direct:
+            selection = inputs.core
         if not points and selection.getbbox() is None:
             return
         executable = self._codex_resolver()
 
         def detect(_update, _pause, cancel):
-            if not semantic:
-                if points:
-                    targets = segment_removal_click(image, points[0], cancelled=cancel)
-                else:
-                    targets = segment_removal_lasso(image, selection, cancelled=cancel)
-                if targets:
-                    return targets, None
-            if cancel.is_set():
-                raise Cancelled("Object detection canceled.")
-            guide = selection
-            if points:
-                x, y = points[0]
-                radius = max(3, min(14, round(min(image.size) * 0.01)))
-                guide = Image.new("L", image.size)
-                ImageDraw.Draw(guide).ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
-            return detect_removal(image, guide, executable(), cancelled=cancel), True
+            path = executable()
+            point = points[0] if points else None
+            targets = detect_removal(image, selection, path, point=point, cancelled=cancel)
+            try:
+                targets = detect_removal_effects(image, targets, path, cancelled=cancel)
+            except Cancelled:
+                raise
+            except CodexError as error:
+                return targets, f"Could not check for cast shadows or reflections. {error}"
+            return targets, ""
 
         def show(result):
-            if self.closing:
-                return
-            if result is None:
-                editor.set_message("Object detection canceled.")
-            else:
-                targets, detailed = result
-                editor.set_targets(targets, detailed=detailed)
+            if not self.closing:
+                targets, message = result
+                editor.set_targets(targets, detailed=True)
+                if message:
+                    editor.set_message(message)
 
-        self._launch("detect_remove", detect, show)
+        self._launch("detect_remove", detect, show, message="Selecting with Codex…")
 
     def _generate_remove(self):
         session = self._remove_session()
@@ -698,28 +899,70 @@ class Window(QMainWindow):
         inputs = session.editor.removal_inputs()
         if inputs is None:
             return
-        core, footprint, labels = inputs
         image, _ = session.editor.generation_input()
         executable = self._codex_resolver()
         prepare = len(session.variants) % 2 == 1
+        cached = session.prepared
 
-        def generate(_update, _pause, cancel):
-            candidate = generate_remove(image, core, footprint, labels, executable, cancelled=cancel, prepare=prepare)
-            preview = render_remove(image, core, footprint, candidate)
+        def generate(update, _pause, cancel):
+            prepared = cached
+            if prepared is None:
+                approved = inputs
+                if inputs.direct:
+                    path = executable()
+                    targets = detect_removal(image, inputs.core, path, direct=True, cancelled=cancel)
+                    if any(not target.selected and not target.protected and target.parent is None for target in targets):
+                        raise CodexError("Codex returned an uncertain object. Try again or choose Review with Lasso.")
+                    targets = detect_removal_effects(image, targets, path, cancelled=cancel, lasso=inputs.core)
+                    approved = inputs.with_detected_objects(image, targets)
+                    if approved is None:
+                        raise CodexError("Codex could not isolate an object. Try again or choose Review with Lasso.")
+                objects = removed_object_layers(image, approved.core, approved.objects, cancelled=cancel)
+                if not objects:
+                    raise CodexError("No visible objects in the selection. Adjust the selection and try again.")
+                prepared = approved, objects
+                update(prepared)
+            approved, objects = prepared
             if cancel.is_set():
                 raise Cancelled("Removal canceled.")
-            return layered_variant(session.document, footprint, preview, None, name="Generative Remove")
+            candidate = generate_remove(
+                image, approved.core, approved.footprint, approved.labels, executable,
+                cancelled=cancel, prepare=prepare, direct=approved.direct,
+            )
+            preview = render_remove(image, approved.core, approved.footprint, candidate)
+            if approved.warning:
+                preview = replace(preview, warning=" ".join(filter(None, (approved.warning, preview.warning))))
+            if cancel.is_set():
+                raise Cancelled("Removal canceled.")
+            return removal_variant(session.document, approved.footprint, preview, objects, cancelled=cancel)
 
-        self._launch("generate_remove", generate, self._append_layer_variant)
+        def prepared(result):
+            session.prepared = result
+            self._set_feedback("Reconstructing the background…", busy=True)
 
-    def _append_layer_variant(self, variant: LayeredVariant | None):
+        message = "Isolating objects with Codex…" if inputs.direct and cached is None else "Removing selected area…"
+        self._launch("generate_remove", generate, self._append_remove_variant, prepared, message=message)
+
+    def _append_remove_variant(self, variant: RemovalVariant):
+        session = self.layer_fill
+        if not isinstance(session, RemoveSession) or self.closing:
+            return
+        # The result may have been queued before the Cancel click reached the window.
+        if self.task is not None and self.task.cancelled.is_set():
+            message = "Removal canceled."
+            session.editor.set_message(message)
+            self._set_feedback(message)
+            return
+        self._append_layer_variant(variant)
+
+    def _append_layer_variant(self, variant: LayeredVariant):
         session = self.layer_fill
         if session is None or self.closing:
             return
-        if variant is None:
-            session.editor.set_message("Generation canceled.")
+        session.variants.append(variant)
+        if isinstance(variant, RemovalVariant):
+            session.editor.add_removal_variant(variant.preview, variant.background)
         else:
-            session.variants.append(variant)
             session.editor.add_variant(variant.preview)
 
     def _apply_layer_fill(self):
@@ -729,15 +972,18 @@ class Window(QMainWindow):
         if isinstance(session.editor, RemoveEditor):
             if self._remove_session() is None:
                 return
-            inputs = session.editor.removal_inputs()
-            if inputs is None:
-                return
-            selection = inputs[1]
-        else:
-            selection = session.editor.mask
         variant = session.variants[session.editor.selected_variant]
+        if isinstance(variant, RemovalVariant):
+            count = len(variant.document.layers) - len(session.document.layers) - 1
+            objects = "1 object layer" if count == 1 else f"{count} object layers"
+            message = f"Applied Generative Remove and {objects}. Undo with Ctrl+Z."
+        else:
+            layer = variant.document.layer(variant.layer_id)
+            destination = "the active layer" if session.document.layer(variant.layer_id) is not None else "a new layer"
+            message = f"Applied to {destination} “{layer.name}”. Undo with Ctrl+Z."
         session.applying = True
         self.editor.set_message("")
+        self._set_feedback("Applying variation…", busy=True)
         self._refresh()
 
         def applied():
@@ -745,11 +991,16 @@ class Window(QMainWindow):
             if self.editor.document is variant.document:
                 self._close_layer_fill()
                 self.editor.canvas.setFocus()
+                self._set_feedback(message)
             else:
                 session.editor.set_message(self.editor.message.text())
+                self._set_feedback("Could not apply the variation.")
                 self._refresh()
 
-        self.editor.apply_fill(variant.document, variant.layer_id, selection)
+        if isinstance(variant, RemovalVariant):
+            self.editor.apply_removal(variant.document, variant.layer_id)
+        else:
+            self.editor.apply_fill(variant.document, variant.layer_id, session.editor.mask)
         if not self.editor.after_edits(applied):
             applied()
 
@@ -763,12 +1014,9 @@ class Window(QMainWindow):
         editor.deleteLater()
         self._refresh()
 
-    def _append_fill_variant(self, result: tuple[FillCandidate, FillPreview] | None, *, already_applied=False):
+    def _append_fill_variant(self, result: tuple[FillCandidate, FillPreview], *, already_applied=False):
         session = self.fill
         if session is None or self.closing:
-            return
-        if result is None:
-            session.editor.set_message("Generation canceled.")
             return
         session.variants.append(result)
         session.editor.add_variant(result[1], already_applied=already_applied)
@@ -793,7 +1041,7 @@ class Window(QMainWindow):
             def render(*_):
                 return candidate, render_fill(session.image, mask, candidate, edit_alpha=edit_alpha)
 
-            self._launch("preview_fill", render, self._append_fill_variant)
+            self._launch("preview_fill", render, self._append_fill_variant, message="Preparing saved variation…")
 
     def _generate_fill(self):
         layered = self.layer_fill
@@ -810,17 +1058,22 @@ class Window(QMainWindow):
 
         def generate(_update, _pause, cancel):
             candidate = generate_fill(image, mask, prompt, edit_alpha, executable(), cancelled=cancel)
-            preview = render_fill(image, mask, candidate, edit_alpha=edit_alpha)
-            result = (candidate, preview) if layered is None else layered_variant(layered.document, mask, preview, target)
+            isolated_layer = layered is not None and target is None and candidate.transparent_background
+            preview = render_fill(image, mask, candidate, edit_alpha=edit_alpha, isolated_layer=isolated_layer)
+            result = (
+                (candidate, preview) if layered is None
+                else layered_variant(layered.document, mask, preview, target, isolated_layer=isolated_layer)
+            )
             if cancel.is_set():
                 raise Cancelled("Generation canceled.")
             return result
 
-        self._launch("generate_fill", generate, self._append_fill_variant if layered is None else self._append_layer_variant)
+        append = self._append_fill_variant if layered is None else self._append_layer_variant
+        self._launch("generate_fill", generate, append, message="Generating variation…")
 
     def _cancel_fill(self):
         if self.task is not None and self.operation in ("generate_fill", "detect_remove", "generate_remove"):
-            self.task.cancelled.set()
+            self._request_cancel()
 
     def _apply_fill(self):
         session = self.fill
@@ -849,8 +1102,9 @@ class Window(QMainWindow):
             if loaded is not None and not self.closing:
                 self._close_fill()
                 self._show_source(loaded)
+                self._set_feedback(f"Saved image version {self.source.name}. Find it in Recent.")
 
-        self._launch("apply_fill", save, show)
+        self._launch("apply_fill", save, show, message="Saving image version…")
 
     def _close_fill(self):
         editor = self.fill.editor
@@ -899,10 +1153,10 @@ class Window(QMainWindow):
                 copyfileobj(source, out)
             return destination
 
-        self._launch("export_fill", save, self._export_finished)
+        self._launch("export_fill", save, self._export_finished, message="Exporting source PNG…")
 
     def _can_open(self):
-        return self.task is None and self.fill is None and self.layer_fill is None
+        return self.task is None and self.fill is None and self.layer_fill is None and self.pattern is None
 
     def _choose_image(self):
         if not self._can_open():
@@ -953,7 +1207,6 @@ class Window(QMainWindow):
 
         return self.editor.after_edits(ready)
 
-
     def _new_document(self):
         if not self._can_open():
             return
@@ -975,8 +1228,14 @@ class Window(QMainWindow):
         def load(_update, _pause, cancel):
             return load_project(project, cancelled=cancel.is_set) if project else Document.from_image(load_source(path), path.name)
 
+        def show(document):
+            self._show_document(document, project)
+            if not self.closing:
+                self._set_feedback(f"Opened {path.name}")
+
         def open_document():
-            self._launch("open_document", load, lambda result: self._show_document(result, project))
+            message = "Opening project…" if project else "Opening image…"
+            self._launch("open_document", load, show, message=message)
 
         if self._confirm_replace(open_document):
             open_document()
@@ -984,6 +1243,7 @@ class Window(QMainWindow):
     def _show_document(self, document: Document | None, path: Path | None = None):
         if document is None or self.closing:
             return
+        self._clear_idle_feedback()
         self.project_path = path
         self.stack.setCurrentWidget(self.editor)
         self.editor.set_document(document)
@@ -1017,8 +1277,9 @@ class Window(QMainWindow):
             def show(image):
                 if image is not None and not self.closing:
                     self.editor.add_image(image, source.name)
+                    self._set_feedback(f"Imported {source.name} as a layer.")
 
-            self._launch("import_layer", lambda *_: load_source(source).convert("RGBA"), show)
+            self._launch("import_layer", lambda *_: load_source(source).convert("RGBA"), show, message="Importing layer…")
 
     def _save_destination(self, title, filename, formats):
         dialog = QFileDialog(self, title)
@@ -1066,15 +1327,14 @@ class Window(QMainWindow):
             return destination.resolve()
 
         def saved(path):
-            if path is not None:
-                self.project_path = path
-                self._remember_project(path)
-                self.editor.mark_saved(document)
-                self.editor.set_message(f"Saved {path.name}")
-                self._history()
-                self.after_task = after_save
+            self.project_path = path
+            self._remember_project(path)
+            self.editor.mark_saved(document)
+            self._set_feedback(f"Saved {path.name}", folder=path.parent)
+            self._history()
+            self.after_task = after_save
 
-        self._launch("save_project", save, saved)
+        self._launch("save_project", save, saved, message="Saving project…")
 
     def _export_document(self):
         if not self._can_open() or self.stack.currentWidget() is not self.editor:
@@ -1090,19 +1350,21 @@ class Window(QMainWindow):
         })
         if destination is None:
             return
+        suffix = destination.suffix.lower()
+        image_format = "JPEG" if suffix in (".jpg", ".jpeg") else suffix[1:].upper()
+        label = f"Exporting {image_format}"
 
         def save(update, _pause, cancel):
             export_document(
-                document, destination, cancelled=cancel.is_set,
-                progress=lambda done, total: update(f"Exporting {done * 100 // total}%"),
+                document, destination, cancelled=cancel.is_set, progress=lambda done, total: update((done, total)),
                 before_publish=lambda _path: self.store.check_export_destination(destination),
             )
             return destination
 
-        def saved(path):
-            self.editor.set_message(f"Exported {path.name}" if path else "Export canceled.")
-
-        self._launch("export_document", save, saved, self.editor.set_message)
+        self._launch(
+            "export_document", save, self._export_finished, lambda counts: self._file_progress(label, counts),
+            message=f"{label}…",
+        )
 
     def _reconstruct(self):
         if not self._can_open() or self.stack.currentWidget() is not self.editor:
@@ -1113,7 +1375,6 @@ class Window(QMainWindow):
         if document is None:
             return
         name = (self.project_path.stem + ".png") if self.project_path else document.name
-        self.editor.set_message("Preparing reconstruction…")
 
         def load(_update, _pause, cancel):
             image = render(document, cancelled=cancel.is_set)
@@ -1125,11 +1386,7 @@ class Window(QMainWindow):
             grid = job.grid if job else suggested_grid(*image.size)
             return source, qimage(np.asarray(image)), grid, sprite, job
 
-        def show(result):
-            self.editor.set_message("")
-            self._show_source(result)
-
-        self._launch("prepare_reconstruction", load, show)
+        self._launch("prepare_reconstruction", load, self._show_source, message="Preparing reconstruction…")
 
     def _return_to_editor(self):
         if not self._can_open():
@@ -1151,7 +1408,7 @@ class Window(QMainWindow):
             return Document.from_image(image, source.name)
 
         def open_document():
-            self._launch("open_document", load, self._show_document)
+            self._launch("open_document", load, self._show_document, message="Opening image…")
 
         if self._confirm_replace(open_document):
             open_document()
@@ -1169,12 +1426,15 @@ class Window(QMainWindow):
                 path = Path(folder) / "reconstruction.png"
                 export_png(
                     job.layout, artifacts, path, alpha=alpha, cancelled=cancel.is_set,
-                    progress=lambda done, total: update(f"Rendering result {done * 100 // total}%"),
+                    progress=lambda done, total: update((done, total)),
                 )
                 return Document.from_image(load_source(path), name)
 
         def open_document():
-            self._launch("open_result", load, self._show_document, self.status.setText)
+            self._launch(
+                "open_result", load, self._show_document, lambda counts: self._file_progress("Rendering result", counts),
+                message="Rendering result…",
+            )
 
         if self._confirm_replace(open_document):
             open_document()
@@ -1202,7 +1462,7 @@ class Window(QMainWindow):
                 sprite = image if image.mode == "RGBA" else None
                 return source, qimage(np.asarray(image)), grid, sprite, None
 
-            self._launch("import", load, self._show_source)
+            self._launch("import", load, self._show_source, message="Opening image…")
         else:
             self._show_grid(self.grid)
 
@@ -1212,6 +1472,7 @@ class Window(QMainWindow):
             self.rows.setValue(grid.rows)
         if self.source is None:
             return
+        self._clear_idle_feedback()
         self.job = job or self.store.find_job(self.source, grid)
         input_scale = self.job.input_scale if self.job else 1
         self.source_label.setToolTip(
@@ -1219,7 +1480,6 @@ class Window(QMainWindow):
         )
         layout = self.image_layout
         self.selected = None
-        self.export_message = ""
         self.comparison.set_source(layout, self.original, self.sprite)
         self._history()
         if self.job is not None and self.task is None:
@@ -1229,7 +1489,7 @@ class Window(QMainWindow):
                 def refresh(_update, _pause, cancel):
                     refresh_thumbnails(self.store, job, alpha=sprite, cancelled=cancel.is_set)
 
-                self._launch("refresh_preview", refresh)
+                self._launch("refresh_preview", refresh, message="Refreshing preview…")
                 return
         self._refresh()
 
@@ -1251,10 +1511,16 @@ class Window(QMainWindow):
             label = "Additional instructions for this tile. They take priority over the global prompt."
             existing = snapshot.tiles.get(cell, Tile()).prompt
         text, accepted = QInputDialog.getMultiLineText(self, title, label, existing)
-        if accepted and text.strip() != existing:
+        prompt = text.strip()
+        if accepted and prompt != existing:
+            batch = self._resumable_batch()
             self.job = self.job or self.store.ensure_job(self.source, layout.grid)
-            self.store.set_prompt(self.job, text.strip(), cell)
-            self.export_message = ""
+            self.store.set_prompt(self.job, prompt, cell)
+            if batch is not None:
+                batch.job = self.job
+                if cell is None:
+                    batch.prompt = prompt
+            self._clear_idle_feedback()
             self._history()
             self._refresh()
 
@@ -1270,13 +1536,27 @@ class Window(QMainWindow):
         self.comparison.select(cell, focus=True)
         self._refresh()
 
-    def _refresh(self):
+    def _refresh_pattern_actions(self):
+        editing = self.stack.currentWidget() is self.editor and self.editor.document is not None
+        enabled = editing and self.task is None and self.pattern is None
+        self.view_button.setVisible(editing)
+        self.filter_button.setVisible(editing)
+        self.view_button.setEnabled(enabled)
+        self.filter_button.setEnabled(enabled)
+        with QSignalBlocker(self.pattern_preview_action):
+            self.pattern_preview_action.setChecked(self.editor.canvas.pattern_preview)
+        self.pattern_preview_action.setEnabled(enabled)
+        layer = self.editor.active_layer
+        self.offset_action.setEnabled(enabled and layer is not None and layer.visible and not layer.locked)
+        self.fix_seams_action.setEnabled(enabled and max(self.editor.document.size) > 1)
+
+    def _refresh(self, *, snapshot: Snapshot | None = None):
         busy = self.task is not None
         page = self.stack.currentWidget()
         comparing = page is self.comparison
         editing = page is self.editor
         session = self.layer_fill or self.fill
-        available = not busy and session is None
+        available = self._can_open()
         for action in (self.open_button, self.open_action, self.new_action, self.empty_button, self.new_button):
             action.setEnabled(available)
         for action in (self.save_action, self.save_as_action, self.export_action):
@@ -1290,6 +1570,7 @@ class Window(QMainWindow):
         self.back_button.setText("Back to editor" if self.editor.document is not None else "Edit input")
         self.sidebar.setVisible(comparing)
         self.editor.set_busy(busy or not editing)
+        self._refresh_pattern_actions()
         document = self.editor.document
         if editing and document is not None:
             title = self.project_path.name if self.project_path else document.name
@@ -1300,20 +1581,29 @@ class Window(QMainWindow):
         elif comparing:
             self.setWindowTitle("Reconstruction — Regimagen")
             self.source_label.setText(f"{number(self.original.width())} × {number(self.original.height())} px")
+        if self.pattern is not None:
+            self.pattern.editor.set_busy(
+                busy, cancellable=self.operation in ("detect_pattern", "generate_pattern"),
+                cancelling=busy and self.task.cancelled.is_set(),
+            )
+            return
         if session is not None:
+            cancelling = busy and self.task.cancelled.is_set()
             busy = busy or (self.layer_fill is not None and self.layer_fill.applying)
             if isinstance(session.editor, RemoveEditor):
                 session.editor.set_busy(
                     busy, generating=self.operation == "generate_remove", detecting=self.operation == "detect_remove",
+                    cancelling=cancelling,
                 )
             else:
-                session.editor.set_busy(busy, generating=self.operation == "generate_fill")
+                session.editor.set_busy(busy, generating=self.operation == "generate_fill", cancelling=cancelling)
             return
         if not comparing:
             return
         self.comparison.fill_button.setEnabled(self.source is not None and not busy)
         layout = self.image_layout
-        snapshot = self._snapshot()
+        if snapshot is None:
+            snapshot = self._snapshot()
         ready = len(snapshot.current_artifacts)
         review = sum(tile.warning is not None and not tile.stale for tile in snapshot.tiles.values())
         count = layout.grid.count if layout else 0
@@ -1327,9 +1617,8 @@ class Window(QMainWindow):
             field.setEnabled(layout is not None and not busy)
         self.grid_map.setEnabled(layout is not None)
         self.grid_map.set_tiles(self.grid, snapshot.tiles, self.selected, self.active)
-        if self.operation not in ("export_image", "export_tiles"):
-            self.progress.setRange(0, 1000)
-            self.progress.setValue(1000 * ready // max(count, 1))
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(1000 * ready // max(count, 1))
         if layout:
             width, height = layout.size
             self.dimensions.setText(f"{number(width)} × {number(height)} px")
@@ -1343,8 +1632,12 @@ class Window(QMainWindow):
         self.edit_result.setEnabled(self.export.isEnabled())
         self.parts.setEnabled(ready > 0 and not busy)
         if self.operation in ("generate", "scale_batch"):
-            self.generate.setText("Pause")
-            self.generate.setEnabled(not self.task.pause.is_set())
+            pausing = self.task.pause.is_set()
+            self.generate.setText("Pausing…" if pausing else "Pause")
+            self.generate.setEnabled(not pausing and not self.task.cancelled.is_set())
+        elif self._resumable_batch() is not None:
+            self.generate.setText("Resume batch")
+            self.generate.setEnabled(not busy)
         else:
             remaining = ready < count or any(tile.attempt for tile in snapshot.tiles.values())
             if count and ready == count and not remaining:
@@ -1372,14 +1665,6 @@ class Window(QMainWindow):
             self.comparison.update_tiles(snapshot)
 
     def _status_text(self, layout: Layout | None, snapshot: Snapshot, ready: int, review: int) -> str:
-        if self.operation == "import":
-            return "Opening image…"
-        if self.operation == "open_fill":
-            return "Opening Generative Fill…"
-        if self.operation == "refresh_preview":
-            return "Refreshing preview…"
-        if self.operation in ("export_image", "export_tiles", "export_fill"):
-            return self.export_message or ("Preparing tile archive…" if self.operation == "export_tiles" else "Assembling PNG…")
         if layout is None:
             return "Open an image to configure the grid."
         if layout.grid_error:
@@ -1387,21 +1672,13 @@ class Window(QMainWindow):
         if not layout.enlarges:
             suggestion = suggested_grid(layout.source_width, layout.source_height)
             return f"This grid is too small to enlarge the image. Use {suggestion.columns}×{suggestion.rows}."
-        if self.operation in ("generate", "scale_batch") and self.task.pause.is_set():
-            return "Pausing after the active edits finish…"
-        if self.active is not None:
-            if self.subagents.isChecked():
-                return f"Generating with subagents · {ready}/{layout.grid.count} ready"
-            return f"Editing · {self.active.label.lower()} · {ready}/{layout.grid.count} ready"
-        if snapshot.notice:
+        summary = f"{ready}/{layout.grid.count} ready" + (f" · {review} to review" if review else "")
+        if snapshot.notice and not self.task_status.text():
             notice = snapshot.notice
-            if snapshot.quota_reset:
-                timestamp = datetime.fromtimestamp(snapshot.quota_reset)
-                notice += f" Resets at {timestamp:%Y-%m-%d %H:%M}."
-            return f"{notice}\n{self.export_message}" if self.export_message else notice
-        if self.export_message:
-            return self.export_message
-        return f"{ready}/{layout.grid.count} ready" + (f" · {review} to review" if review else "")
+            if timestamp := quota_reset_text(snapshot.quota_reset):
+                notice += f" Resets at {timestamp}."
+            return f"{summary}\n{notice}"
+        return summary
 
     def _choose_codex(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1416,41 +1693,77 @@ class Window(QMainWindow):
         self.settings_button.setToolTip("Detect the Codex CLI automatically")
 
     def _generate_or_pause(self):
-        if self.operation in ("generate", "scale_batch") and self.task is not None:
-            self.task.pause.set()
-            self._refresh()
+        if self.task is not None:
+            if self.operation in ("generate", "scale_batch") and not self.task.cancelled.is_set():
+                self.task.pause.set()
+                self._set_feedback("Pausing after the current work finishes…", busy=True)
+                self._refresh()
+            return
+        batch = self._resumable_batch()
+        if batch is not None:
+            self._run_batch(batch)
         elif self.image_layout:
             self._start(self.image_layout.cells)
 
     def _start_preview(self):
         if self.image_layout:
-            self._start(self.image_layout.preview(self.selected))
+            self._start(self.image_layout.preview(self.selected), preview=True)
 
     def _retry(self):
         if self.selected is not None:
             self._start((self.selected,), replace=True)
 
-    def _start(self, selection, *, replace=False):
+    def _start(self, selection: tuple[Cell, ...], *, preview=False, replace=False):
         layout = self.image_layout
         if self.task is not None or layout is None or layout.grid_error or not layout.enlarges:
             return
         job = self.job or self.store.ensure_job(self.source, layout.grid)
         self.job = job
-        cells = list(selection) if replace else pending_cells(self.store.snapshot(job), selection)
+        snapshot = self.store.snapshot(job)
+        cells = selection if replace else pending_cells(snapshot, selection)
         if not cells:
             return
-        self.export_message = ""
+        previous = None
+        if replace:
+            cell = selection[0]
+            previous = snapshot.tiles[cell].artifact
+            action = "Regenerate tile" if previous else "Generate tile"
+            subject = "Tile regeneration" if previous else "Tile generation"
+            label = f"{'Regenerating' if previous else 'Generating'} tile · {cell.label}"
+            success = f"{cell.label} · {'Tile regenerated' if previous else 'Tile ready'}."
+        elif preview:
+            action = "Generate 2×2 preview"
+            subject = "Preview"
+            label = "Preview 2×2"
+            success = f"Preview ready. {len(selection)} tiles available for reconstruction."
+        else:
+            action = "Resume job"
+            subject = label = "Reconstruction"
+            success = "Reconstruction complete. Export the PNG or open the result in the editor."
         self._history()
         use_subagents = self.subagents.isChecked()
         executable = self._codex_resolver()
 
         def generate(update, pause, cancel):
-            run_tiles(
+            return run_tiles(
                 self.store, job, cells, executable, pause=pause, cancelled=cancel,
                 on_change=update, subagents=use_subagents,
             )
 
-        self._launch("generate", generate, updated=self._generation_update)
+        def update(active):
+            self._generation_update(active, label, selection, previous=previous)
+
+        def finished(outcome):
+            resume = f"Use {action} to continue."
+            if preview or replace:
+                resume = f"Select {selection[0].label.lower()} in the grid, then use {action} to continue."
+            self._set_feedback(self._run_message(outcome, subject, success, resume))
+
+        ready, total = len(selection) - len(cells), len(selection)
+        self._launch(
+            "generate", generate, finished, update,
+            message=self._tiles_message(label, ready, total), progress=(ready, total),
+        )
 
     def _codex_resolver(self) -> Callable[[], Path]:
         custom = self.settings.value("codex", "", str)
@@ -1534,14 +1847,33 @@ class Window(QMainWindow):
             return
         self.settings.setValue("scales", field.text())
         self.settings.setValue("chainedScales", mode.currentData())
+        self._run_batch(ScaleBatch(source, tuple(layouts), Path(parent), self._snapshot().prompt, self.job, self.grid))
+
+    def _resumable_batch(self) -> ScaleBatch | None:
+        batch = self.scale_batch
+        if batch is not None and (batch.source, batch.job, batch.grid) == (self.source, self.job, self.grid):
+            return batch
+        return None
+
+    def _run_batch(self, batch: ScaleBatch):
+        self.scale_batch = batch
+        batch.completed = 0
+        published = dict(batch.published)
+        labels = {
+            layout.scale: f"Scale {index}/{len(batch.layouts)} · {layout.scale}×"
+            for index, layout in enumerate(batch.layouts, 1)
+        }
         use_subagents = self.subagents.isChecked()
         executable = self._codex_resolver()
-        prompt = self._snapshot().prompt
-        displayed_input = self.job.input_path if self.job else source.path
-        self.export_message = ""
+        displayed_input = self.job.input_path if self.job else batch.source.path
 
         def generate(update, pause, cancel):
             input_path = displayed_input
+            outcome = RunOutcome()
+            # The worker records output checkpoints. The window reads them after the task returns.
+            self.store.check_export_destination(batch.folder or batch.parent)
+            if batch.folder is None:
+                batch.folder = Path(mkdtemp(prefix=f"{Path(batch.source.name).stem}-scales-", dir=batch.parent))
 
             def stage(job, image):
                 nonlocal input_path
@@ -1552,35 +1884,81 @@ class Window(QMainWindow):
                     sprite = image if image.mode == "RGBA" else None
                     update((job, qimage(np.asarray(image)), sprite))
 
-            return run_scale_batch(
-                self.store, source, layouts, executable, Path(parent),
-                pause=pause, cancelled=cancel, prompt=prompt, subagents=use_subagents,
-                on_stage=stage, on_change=update, on_export=lambda scale: update(f"Exporting {scale}× PNG…"),
+            def checkpoint(job, _destination, revision, digest):
+                batch.published[job.scale] = (revision, digest)
+                batch.completed += 1
+
+            def stopped(result):
+                nonlocal outcome
+                outcome = result
+
+            outputs = run_scale_batch(
+                self.store, batch.source, batch.layouts, executable, batch.parent,
+                pause=pause, cancelled=cancel, prompt=batch.prompt, subagents=use_subagents,
+                on_stage=stage, on_change=update, on_export=lambda scale: update(f"{labels[scale]} · Exporting PNG…"),
+                folder=batch.folder, published=published, on_published=checkpoint, on_outcome=stopped, protect_outputs=True,
             )
+            return outcome, outputs
 
-        self._launch("scale_batch", generate, self._batch_finished, self._batch_update)
+        stage_label, stage_cells = "", ()
 
-    def _batch_update(self, update):
-        if isinstance(update, tuple):
-            job, image, sprite = update
-            if image is not None:
-                self._set_input(image, sprite)
-            self._show_grid(job.grid, job)
-        elif isinstance(update, str):
-            self.status.setText(update)
-        else:
-            self._generation_update(update)
+        def update(state):
+            nonlocal stage_label, stage_cells
+            if isinstance(state, tuple):
+                job, image, sprite = state
+                batch.job, batch.grid = job, job.grid
+                stage_label, stage_cells = labels[job.scale], job.layout.cells
+                if image is not None:
+                    self._set_input(image, sprite)
+                self.active = None
+                self._show_grid(job.grid, job)
+                self._report_tiles(stage_label, self._snapshot(), stage_cells)
+            elif isinstance(state, str):
+                self._report_progress(state)
+            else:
+                self._generation_update(state, stage_label, stage_cells)
+
+        self._launch("scale_batch", generate, self._batch_finished, update, message="Preparing scale batch…")
 
     def _batch_finished(self, result):
-        if result is not None:
-            folder, completed, count = result
-            self.export_message = f"Exported {completed}/{count} PNGs · {folder}"
-            self.status.setToolTip(str(folder))
+        outcome, (folder, completed, count) = result
+        summary = f"Exported {completed}/{count} PNGs."
+        if outcome.state == "completed":
+            self.scale_batch = None
+            message = f"Scale batch complete. {summary}"
+        else:
+            message = self._run_message(outcome, "Scale batch", "", "Use Resume batch to continue.")
+            message = f"{message} {summary}"
+        self._set_feedback(message, folder=folder if completed else None)
         self._history()
 
-    def _generation_update(self, active: Cell | None):
+    def _generation_update(self, active: Cell | None, label: str, cells: tuple[Cell, ...], *, previous=None):
         self.active = active
-        self._refresh()
+        snapshot = self._snapshot()
+        self._report_tiles(label, snapshot, cells, previous=previous)
+        self._refresh(snapshot=snapshot)
+
+    def _report_tiles(self, label: str, snapshot: Snapshot, cells: tuple[Cell, ...], *, previous=None):
+        ready = len(cells) - len(pending_cells(snapshot, cells))
+        if previous is not None and snapshot.tiles[cells[0]].artifact == previous:
+            ready = 0
+        self._report_progress(self._tiles_message(label, ready, len(cells)), (ready, len(cells)))
+
+    @staticmethod
+    def _tiles_message(label: str, ready: int, total: int) -> str:
+        return f"{label} · {ready}/{total} tiles ready" if total > 1 else label
+
+    @staticmethod
+    def _run_message(outcome: RunOutcome, subject: str, success: str, resume: str) -> str:
+        if outcome.state == "completed":
+            return success
+        if outcome.state in ("paused", "canceled"):
+            return f"{subject} {outcome.state}. Completed tiles are saved. {resume}"
+        if outcome.state == "quota_limited":
+            return f"{quota_message(outcome.quota_reset, 'Resume')} Completed tiles are saved. {resume}"
+        if outcome.code == "AUTH_REQUIRED":
+            return f"{subject} requires Codex sign-in. Run codex login. {resume}"
+        return f"{subject} failed. {outcome.message or ''} {resume}"
 
     def _export(self, *, parts=False):
         job = self.job
@@ -1589,22 +1967,14 @@ class Window(QMainWindow):
         snapshot = self.store.snapshot(job)
         extension = "zip" if parts else "png"
         title = "Export tiles (ZIP)" if parts else "Export PNG"
-        dialog = QFileDialog(self, title)
-        dialog.setOption(QFileDialog.Option.DontUseNativeDialog)
-        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        dialog.setNameFilter("ZIP (*.zip)" if parts else "PNG (*.png)")
-        dialog.setDefaultSuffix(extension)
         variant = f"{job.scale}x" if job.scale else f"{job.grid.columns}x{job.grid.rows}"
         suffix = "-tiles" if parts else ""
-        dialog.selectFile(f"{Path(job.source.name).stem}-{variant}{suffix}.{extension}")
-        if not dialog.exec():
+        filename = f"{Path(job.source.name).stem}-{variant}{suffix}.{extension}"
+        destination = self._save_destination(title, filename, {f"{extension.upper()} (*.{extension})": (extension,)})
+        if destination is None:
             return
-        destination = Path(dialog.selectedFiles()[0])
-        if destination.suffix.lower() != f".{extension}":
-            QMessageBox.information(self, title, f"Choose a filename ending in .{extension}.")
-            return
-        self.export_message = ""
         alpha = self.sprite
+        label = "Exporting tiles" if parts else "Exporting PNG"
 
         def save(update, _pause, cancel):
             exporter = export_parts if parts else export_png
@@ -1613,45 +1983,132 @@ class Window(QMainWindow):
                 progress=lambda done, total: update((done, total)),
                 cancelled=cancel.is_set,
                 alpha=alpha,
+                before_publish=lambda _path: self.store.check_export_destination(destination),
             )
             return destination
 
-        self._launch("export_tiles" if parts else "export_image", save, self._export_finished, self._export_update)
+        self._launch(
+            "export_tiles" if parts else "export_image", save, self._export_finished,
+            lambda counts: self._file_progress(label, counts), message=f"{label}…",
+        )
 
-    def _export_update(self, state: tuple[int, int]):
-        done, total = state
-        self.progress.setRange(0, 1000)
-        self.progress.setValue(1000 * done // total)
-        kind = "tiles" if self.operation == "export_tiles" else "PNG"
-        self.export_message = f"Exporting {kind} · {100 * done // total}%"
-        self.status.setText(self.export_message)
+    def _file_progress(self, label: str, counts: tuple[int, int]):
+        done, total = counts
+        if 0 <= done < total:
+            self._report_progress(f"{label} · {100 * done // total}%", counts)
+        else:
+            self._report_progress(f"{label} · Finalizing…")
 
-    def _export_finished(self, destination: Path | None):
-        self.export_message = f"Exported {destination.name}" if destination else ""
-        if destination:
-            self.status.setToolTip(str(destination))
+    def _export_finished(self, destination: Path):
+        self._set_feedback(f"Exported {destination.name}", folder=destination.parent)
 
-    def _launch(self, name: str, operation, succeeded=None, updated=None):
+    def _set_feedback(
+        self, message: str = "", *, busy: bool = False, progress: tuple[int, int] | None = None,
+        folder: Path | None = None,
+    ):
+        self.task_status.setText(message)
+        if progress is not None:
+            done, total = progress
+            self.task_progress.setRange(0, total)
+            self.task_progress.setValue(done)
+        elif busy:
+            self.task_progress.setRange(0, 0)
+        self.task_progress.setVisible(busy)
+        self.output_folder = folder
+        self.open_folder.setToolTip(str(folder) if folder is not None else "")
+        self.open_folder.setVisible(folder is not None)
+
+    def _report_progress(self, message: str, progress: tuple[int, int] | None = None):
+        if self.task is not None and not (self.task.pause.is_set() or self.task.cancelled.is_set()):
+            self._set_feedback(message, busy=True, progress=progress)
+
+    def _clear_idle_feedback(self):
+        if self.task is None and (self.layer_fill is None or not self.layer_fill.applying):
+            self._set_feedback()
+
+    def _open_output_folder(self):
+        folder = self.output_folder
+        if folder is not None:
+            url = QUrl.fromLocalFile(str(folder.absolute()))
+            if not folder.is_dir() or not QDesktopServices.openUrl(url):
+                self._set_feedback(f"Could not open the folder · {folder}", folder=folder)
+
+    def _launch(
+        self, name: str, operation, succeeded=None, updated=None, *, message: str,
+        progress: tuple[int, int] | None = None,
+    ):
+        def complete(result):
+            self._set_feedback()
+            if succeeded is not None:
+                succeeded(result)
+
         self.operation = name
         self.task = Task(operation, self)
-        if succeeded is not None:
-            self.task.succeeded.connect(succeeded)
+        self.task.succeeded.connect(complete)
         if updated is not None:
             self.task.updated.connect(updated)
         self.task.failed.connect(self._show_failure)
         self.task.finished.connect(self._task_finished)
+        session = self.layer_fill or self.fill
+        if session is not None:
+            session.editor.set_message("")
+        if self.pattern is not None:
+            self.pattern.editor.set_message("")
+        self._set_feedback(message, busy=True, progress=progress)
         self._refresh()
         self.task.start()
 
-    def _show_failure(self, message: str):
-        if not self.closing:
-            session = self.layer_fill or self.fill
+    def _show_failure(self, error: Exception):
+        detail = str(error)
+        folder = None
+        if isinstance(error, Cancelled):
+            message = detail or "Canceled."
+        elif isinstance(error, AuthRequired):
+            message = "Codex sign-in required. Run codex login, then try again."
+        elif isinstance(error, QuotaPaused):
+            message = quota_message(error.resets_at, "Try again")
+        elif self.operation == "save_project" or self.operation.startswith("export_"):
+            prefix = "Could not save the project." if self.operation == "save_project" else "Export failed."
+            recovery = " Check the destination or choose another folder." if isinstance(error, OSError) else ""
+            message = f"{prefix} {detail}{recovery}"
+        elif self.operation in ("import", "open_document", "open_result"):
+            message = f"Could not open the file. {detail}"
+        else:
+            session = self.pattern or self.layer_fill or self.fill
             if session is not None:
-                session.editor.set_message(message)
-            elif self.stack.currentWidget() is self.editor:
-                self.editor.set_message(message)
+                session.editor.set_message(detail)
+                message = {
+                    "detect_remove": "Object detection failed.",
+                    "detect_pattern": "Seam detection failed.",
+                    "generate_pattern": "Pattern repair failed.",
+                }.get(self.operation, "Could not complete the edit.")
             else:
-                QMessageBox.warning(self, "Regimagen", message)
+                prefix = {
+                    "generate": "Generation failed.",
+                    "scale_batch": "Scale batch failed.",
+                    "prepare_reconstruction": "Could not prepare reconstruction.",
+                    "refresh_preview": "Could not refresh the preview.",
+                    "import_layer": "Could not import the layer.",
+                    "open_fill": "Could not open the generative editor.",
+                    "open_pattern": "Could not open pattern repair.",
+                }.get(self.operation, "Could not complete the operation.")
+                message = f"{prefix} {detail}"
+        if self.operation == "scale_batch":
+            batch = self.scale_batch
+            conflict = isinstance(error, FileExistsError)
+            if conflict:
+                message += " Move or rename the conflicting file, or use Generate scale batch to choose another folder."
+            elif isinstance(error, OSError):
+                message += " Check the destination or choose another folder."
+            message += f" Exported {batch.completed}/{len(batch.layouts)} PNGs. Use Resume batch to continue."
+            folder = batch.folder if batch.completed or conflict else None
+        self._set_feedback(message, folder=folder)
+
+    def _request_cancel(self):
+        if self.task is not None and not self.task.cancelled.is_set():
+            self.task.cancelled.set()
+            self._set_feedback("Cancelling…", busy=True)
+            self._refresh()
 
     def _task_finished(self):
         self.task.deleteLater()
@@ -1675,7 +2132,7 @@ class Window(QMainWindow):
     def closeEvent(self, event):
         if self.task is not None:
             self.closing = True
-            self.task.cancelled.set()
+            self._request_cancel()
             event.ignore()
             return
         if self._after_editor_edits(self.close):
@@ -1691,6 +2148,7 @@ STYLESHEET = """
 QWidget { color: #edf1f7; font-size: 13px; }
 QWidget#root { background: #161921; }
 QFrame#header { background: #1c2029; border-bottom: 1px solid #303644; }
+QFrame#taskFooter { background: #1c2029; border-top: 1px solid #303644; }
 QLabel#brand { font-size: 20px; font-weight: 700; }
 QLabel#section { font-size: 14px; font-weight: 650; }
 QLabel#emptyTitle { font-size: 26px; font-weight: 650; }
@@ -1713,6 +2171,7 @@ QPushButton, QComboBox, QSpinBox {
 }
 QPushButton:hover, QComboBox:hover, QSpinBox:hover { background: #323a4a; }
 QPushButton:focus, QComboBox:focus, QSpinBox:focus { border-color: #8ce1c6; }
+QPushButton#openOutputFolder { padding: 3px 10px; min-height: 18px; }
 QPushButton[primary="true"] { color: #102722; background: #8ce1c6; border-color: #8ce1c6; font-weight: 700; }
 QPushButton[primary="true"]:hover { background: #a5ecd6; }
 QPushButton:disabled, QPushButton[primary="true"]:disabled, QSpinBox:disabled, QComboBox:disabled {

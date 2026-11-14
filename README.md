@@ -17,14 +17,15 @@
 
 - **Canvas and layers.** Move, reorder, duplicate, hide, and lock layers. Use rectangular and lasso selections to crop the canvas or work on part of a layer. Save editable layers, masks, and pixels together in a portable `.regimagen` project.
 - **Manual retouching.** Paint pixels or masks with the brush and eraser. Rotate, flip, and resize layers, or preview brightness, contrast, and saturation adjustments. Undo and redo edits in the current session. Export the composition as PNG or WebP with transparency, or JPEG with a white background.
-- **Generative Fill.** Choose **New layer** to use the visible composition, or **Active layer** to edit a visible, unlocked raster layer. Select an area, describe the edit, and compare variations before applying. Turn on **Edit Transparency** to add or remove coverage. To reduce the selection of a previously saved image version, open it from **Recent** and choose **Image version → Reopen fill**.
-- **Generative Remove.** Click an object or draw around it with **Lasso**, review the proposed area, and remove it on a separate layer. [Generative Remove workflow](#generative-remove)
+- **Repeating patterns.** Use **View → Pattern Preview** to see the canvas repeat as you edit the center tile. **Filter → Other → Offset** shifts the active layer with wraparound. **Filter → Fix Pattern Seams** uses Codex to propose a seam mask and Generative Fill to repair it. [Pattern workflow](#repeating-patterns)
+- **Generative Fill.** Choose **New layer** to use the visible composition, or **Active layer** to edit a visible, unlocked raster layer. Select an area, describe the edit, and compare variations before applying. A prompt for a transparent background creates a cutout on **New layer**. You can also enable **Edit Transparency** to allow coverage changes. To reduce the selection of a previously saved image version, open it from **Recent** and choose **Image version → Reopen fill**.
+- **Generative Remove.** Reconstruct the background and keep each removed object as a movable layer with transparency. Use **Click**, **Lasso**, or **Direct Lasso** to identify the objects. [Generative Remove workflow](#generative-remove)
 - **Configurable reconstruction.** Choose at least 2 columns and 2 rows. Regimagen previews the output size and tile count before generation and suggests the smallest grid that can fit at least 2× the source dimensions.
 - **Reusable 2×2 previews.** Check a four-tile region before running the full grid. The full job reuses completed tiles from the same grid.
 - **Art direction and review.** Set a global prompt and per-tile overrides, inspect seams with synchronized zoom, and regenerate individual tiles.
 - **Scale batches.** Generate exact multiples of the original size. Each stage can use the original input or the preceding stage's result.
 - **Flexible exports.** Export a lossless PNG with source transparency, or a ZIP of completed tiles with placement metadata. Fully transparent tiles are completed locally and included in both exports. The CLI can also export an individual tile.
-- **Local checkpoints.** Completed tiles and prompts are saved in the workspace. Pause or resume long jobs and enable Codex subagents when you want parallel generation.
+- **Local checkpoints.** Completed tiles and prompts are saved in the workspace. Pause or resume long jobs and enable Codex subagents when you want parallel generation. **Resume batch** continues an interrupted scale batch in the same folder. If a destination PNG conflicts with the batch, move or rename that file before resuming, or start a new batch in another folder.
 
 Use the preview and seam review to check generated tiles before committing to a large grid. Regimagen sends image references to Codex under your account when it requests generation or visual analysis.
 
@@ -38,11 +39,20 @@ Use the preview and seam review to check generated tiles before committing to a 
 
 ## Generative Remove
 
-1. Open **Generative Remove** in the layered editor. Use **Click** for one object or **Lasso** to draw around one or more objects. If you already made a selection in the editor, choose **Detect objects** to analyze it.
-2. Check the outlined area. Amber shows where a proposed edit extends beyond the lasso. When detailed review opens, check the objects and effects you want to remove. Use **Refine selection** to open this review for a simple selection. **Add** and **Subtract** let you adjust the area, and **Detect objects and effects** can identify shadows, reflections, and nearby objects to protect. Choose **Use selection manually** to work directly from your lasso.
-3. Choose **Remove**, then inspect the result with **Before** and **After**. For a reconstructed background, use **Generate another** to compare an alternative. **Apply** adds the chosen result as a reversible layer. Use **File → Save project** to keep the layers and **File → Export image** to save a PNG with transparency.
+1. Open **Generative Remove…** in the layered editor. Choose **Direct Lasso** and draw around the whole object, including thin details such as wires. If you already drew a selection, choose **Use Lasso directly**.
+2. Click **Remove**. Codex traces the object within the lasso and checks for effects such as its cast shadow. You can leave the shadow outside the lasso. The background repair follows confirmed effects past the outline and blends into the nearby surface.
+3. Inspect the repair in **Background**. **Before** shows the original and **After** shows the cutouts in their original positions over the repaired background. Use **Generate another** to try a different background with the same cutouts. If Codex is unsure which object you meant, adjust the lasso or choose **Review with Lasso**.
+4. Click **Apply** to add the **Generative Remove** background layer and a transparent layer for each object. The top object layer is selected. Use **Move** or hide the layer in **Layers** to reveal the repaired background. One undo reverses the entire removal. Use **File → Save project** to keep the layer positions, pixels, and visibility.
 
-The bundled EfficientSAM model proposes outlines on the CPU. Ambiguous selections and background reconstruction use Codex. On transparent images, Regimagen can clear exposed empty areas locally. When part of a selection needs reconstruction, the request marks that part and includes surrounding image context. The composition preserves pixels outside the approved area and in protected regions. Inspect boundaries at the intended export size before applying a variation.
+To review the masks before generating, use **Click**, **Lasso**, or **Select with Codex** for an existing selection. Check the objects and effects to remove. **Add** extends the checked item you select in the list. **Subtract** protects the marked area, and **Regenerate selection** keeps those exclusions when it retraces the objects. Shadows and reflections are repaired on the background layer. The object layers use pixels from the original composition, including their transparency. Regimagen restores clear background locally where the selected object is surrounded by transparency.
+
+## Repeating patterns
+
+1. Open an image in the layered editor and turn on **View → Pattern Preview**. Zoom and pan to inspect the joins. Changes to the center tile update the surrounding copies.
+2. To inspect the wrap of one layer, choose **Filter → Other → Offset** and preview the horizontal and vertical shifts. **Apply** commits the shift to the active layer.
+3. Choose **Filter → Fix Pattern Seams…** to repair the visible composition. Regimagen opens an offset view so you can see the joins in the middle of the tile. Choose **Detect Seams** for a proposed mask, or draw one with **Lasso** or **Rectangle**. Use **Add** and **Subtract** to refine the mask, then choose **Generate**.
+4. Turn on **Pattern Preview** in the repair view and compare **Before** and **After** across the tile boundaries. Amber marks joins that may need another pass. Use **Generate Another** to compare a different repair.
+5. Click **Apply** to add a **Pattern Seam Repair** layer at the original tile position. **File → Export image** saves one tile at the canvas dimensions. Use PNG or WebP to retain transparency.
 
 ## CLI and AI automation
 

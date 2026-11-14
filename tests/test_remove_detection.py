@@ -1,23 +1,19 @@
 from pathlib import Path
 from threading import Event
 
-import numpy as np
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from regimagen.codex import Cancelled, CodexError
 from regimagen.geometry import Rect
-from regimagen.remove_detection import _guide, detect_removal, segment_removal_click, segment_removal_lasso
+from regimagen.remove_detection import RemovalTarget, _guide, detect_removal, detect_removal_effects
 
 
-def _description(label, bounds, *, uncertain=False):
+def _outline(label, bounds, *, view="overview", uncertain=False):
     left, top, right, bottom = bounds
     return {
         "label": label,
-        "view": "overview",
-        "bounds": bounds,
-        "foreground": [[(left + right) / 2, (top + bottom) / 2]],
-        "background": [],
+        "view": view,
         "contours": [[[left, top], [right, top], [right, bottom], [left, bottom]]],
         "uncertain": uncertain,
     }
@@ -27,6 +23,7 @@ class _FakeAnalysis:
     def __init__(self, result):
         self.result = result
         self.calls = 0
+        self.prompt = ""
 
     def __call__(self, _executable, _cwd, *, cancelled, image_generation):
         assert not image_generation and not cancelled.is_set()
@@ -38,90 +35,185 @@ class _FakeAnalysis:
     def __exit__(self, *_):
         pass
 
-    def analyze_images(self, _prompt, references, schema):
+    def analyze_images(self, prompt, references, schema, *, effort=None):
         self.calls += 1
-        assert {"targets", "protected"} == set(schema["properties"])
-        assert [path.name for path in references] == ["detail.png", "overview.png"]
-        for path in references:
-            with Image.open(path) as guide:
-                assert max(guide.size) == 1024
-                assert guide.mode == "RGB"
+        self.prompt = prompt
+        effect_scan = set(schema["properties"]) == {"effects"}
+        names = ["detail.png", "object-outline.png"] if effect_scan else ["detail.png", "mark.png", "overview.png"]
+        if effect_scan and len(references) == 3:
+            names.append("possible-effects.png")
+        assert [path.name for path in references] == names
+        with Image.open(references[0]) as clean, Image.open(references[1]) as marked:
+            assert max(clean.size) == 1024 and clean.mode == "RGB"
+            assert clean.size == marked.size and clean.tobytes() != marked.tobytes()
         return self.result
 
 
-class _BoundsSegmenter:
-    def segment(self, image, bounds, foreground, background):
-        assert foreground
-        result = np.zeros(image.shape[:2], dtype=np.uint8)
-        result[bounds.slices] = 1
-        return result
-
-
-def test_detection_expands_targets_beyond_lasso_and_retains_review_roles():
+def test_codex_selection_keeps_the_returned_contours_and_review_roles():
+    # An untextured source cannot produce these shapes from pixel boundaries.
     base = Image.new("RGB", (200, 150), (25, 75, 110))
     lasso = Image.new("L", base.size)
-    draw = ImageDraw.Draw(lasso)
-    draw.rectangle((86, 51, 101, 81), fill=255)
-    draw.rectangle((146, 56, 153, 72), fill=255)
-    first = _description("Lamp", [375, 240, 630, 690])
-    shadow = _description("Lamp shadow", [580, 675, 735, 740])
-    second = _description("Nearby vase", [690, 305, 845, 620], uncertain=True)
-    distant = _description("Unselected corner", [0, 0, 100, 100])
-    foreground = _description("Foreground rail", [465, 420, 484, 550])
+    lasso.paste(255, (86, 51, 101, 81))
+    lasso.paste(255, (146, 56, 153, 72))
+    subject = _outline("Whole object", [375, 240, 630, 690])
+    shadow = _outline("Cast shadow", [580, 675, 735, 740])
+    nearby = _outline("Nearby vase", [690, 305, 845, 620], uncertain=True)
+    distant = _outline("Distant object", [0, 0, 100, 100])
+    foreground = _outline("Foreground rail", [465, 420, 484, 550])
     client = _FakeAnalysis({
-        "targets": [{**first, "effects": [shadow]}, {**second, "effects": []}, {**distant, "effects": []}],
+        "targets": [{**subject, "effects": [shadow]}, {**nearby, "effects": []}, {**distant, "effects": []}],
         "protected": [foreground],
     })
 
-    targets = detect_removal(
-        base, lasso, Path("codex"), cancelled=Event(), client_factory=client, segmenter_factory=_BoundsSegmenter,
-    )
+    targets = detect_removal(base, lasso, Path("codex"), cancelled=Event(), client_factory=client)
 
-    assert client.calls == 1
-    assert [target.label for target in targets] == ["Lamp", "Lamp shadow", "Nearby vase", "Foreground rail"]
+    assert client.calls == 1 and "The user used a lasso." in client.prompt
+    assert [target.label for target in targets] == ["Whole object", "Cast shadow", "Nearby vase", "Foreground rail"]
     assert targets[0].origin == (75, 36)
-    assert targets[0].mask.size == (51, 68)
-    assert targets[0].mask.mode == "L"
+    assert targets[0].mask.size == (52, 68)
+    assert targets[0].mask.getextrema() == (255, 255)
     assert targets[1].parent == 0
     assert [target.selected for target in targets] == [True, True, False, False]
     assert [target.protected for target in targets] == [False, False, False, True]
 
 
-def test_detection_ignores_targets_in_the_gap_between_lasso_components():
+def test_codex_selection_keeps_multipart_wire_and_the_adjacent_gap():
+    base = Image.new("RGB", (100, 100), (34, 70, 110))
+    lasso = Image.new("L", base.size)
+    lasso.paste(255, (20, 19, 62, 65))
+    proposal = _outline("Hanging object", [240, 220, 550, 360], view="detail")
+    proposal["contours"].extend(
+        _outline("", bounds)["contours"][0]
+        for bounds in ([240, 480, 550, 590], [340, 350, 360, 490])
+    )
+    client = _FakeAnalysis({"targets": [{**proposal, "effects": []}], "protected": []})
+
+    (target,) = detect_removal(base, lasso, Path("codex"), cancelled=Event(), client_factory=client)
+
+    x, y = target.origin
+    assert target.selected and target.mask.getpixel((35 - x, 42 - y)) == 255
+    assert target.mask.getpixel((28 - x, 42 - y)) == 0
+
+
+def test_direct_lasso_requests_object_effect_and_protection_contours():
+    base = Image.new("RGB", (100, 100), (34, 70, 110))
+    lasso = Image.new("L", base.size)
+    lasso.paste(255, (20, 19, 62, 65))
+    proposal = _outline("Lamp", [240, 220, 550, 360], view="detail")
+    shadow = _outline("Shadow", [310, 380, 600, 450], view="detail")
+    protected = _outline("Vase", [615, 500, 700, 560], view="detail")
+
+    class DirectAnalysis(_FakeAnalysis):
+        def analyze_images(self, prompt, references, schema, *, effort):
+            assert effort == "medium" and "their visible effects, including outside it" in prompt
+            assert "fine wire or cord continuously" in prompt and "the whole cast shadow" in prompt
+            return super().analyze_images(prompt, references, schema)
+
+    client = DirectAnalysis({"targets": [{**proposal, "effects": [shadow]}], "protected": [protected]})
+    targets = detect_removal(base, lasso, Path("codex"), direct=True, cancelled=Event(), client_factory=client)
+    assert [target.label for target in targets] == ["Lamp", "Shadow", "Vase"] and client.calls == 1
+    assert targets[0].origin == (21, 20)
+    assert targets[1].parent == 0 and targets[2].protected
+
+
+def test_detection_ignores_contours_in_the_gap_between_lasso_components():
     base = Image.new("RGB", (200, 100), (26, 74, 105))
     lasso = Image.new("L", base.size)
     lasso.paste(255, (5, 10, 25, 40))
     lasso.paste(255, (175, 10, 195, 40))
     client = _FakeAnalysis({
-        "targets": [{**_description("Not selected", [450, 200, 550, 350]), "effects": []}],
+        "targets": [{**_outline("Unselected object", [450, 200, 550, 350]), "effects": []}],
         "protected": [],
     })
 
-    assert not detect_removal(
-        base, lasso, Path("codex"), cancelled=Event(), client_factory=client, segmenter_factory=_BoundsSegmenter,
-    )
+    assert not detect_removal(base, lasso, Path("codex"), cancelled=Event(), client_factory=client)
 
 
-def test_missing_segmenter_uses_local_contour_refinement():
-    base = Image.new("RGB", (100, 100), (15, 120, 140))
-    base.paste((215, 70, 35), (32, 28, 68, 75))
+def test_click_uses_codex_and_clips_the_contour_to_visible_pixels():
+    base = Image.new("RGBA", (100, 100))
+    base.paste((200, 80, 10, 255), (24, 22, 56, 60))
     lasso = Image.new("L", base.size)
-    lasso.paste(255, (41, 40, 57, 64))
-    client = _FakeAnalysis({
-        "targets": [{**_description("Object", [270, 240, 730, 790]), "effects": []}],
-        "protected": [],
-    })
+    object_outline = _outline("Clicked object", [200, 190, 620, 650], view="detail")
+    client = _FakeAnalysis({"targets": [{**object_outline, "effects": []}], "protected": []})
 
-    def missing_model():
-        raise RuntimeError("Missing model")
-
+    assert not detect_removal(base, lasso, Path("codex"), point=(10, 10), cancelled=Event(), client_factory=client)
+    assert client.calls == 0
     (target,) = detect_removal(
-        base, lasso, Path("codex"), cancelled=Event(), client_factory=client, segmenter_factory=missing_model,
+        base, lasso, Path("codex"), point=(30, 31), cancelled=Event(), client_factory=client,
     )
-    assert target.selected
-    assert target.origin == (32, 28)
-    assert target.mask.size == (36, 47)
-    assert target.mask.getextrema() == (255, 255)
+    assert client.calls == 1 and "The user used a click." in client.prompt
+    assert target.origin == (24, 22) and target.mask.size == (32, 38)
+
+
+def test_effect_pass_rechecks_an_uncertain_shadow_beyond_the_selected_object():
+    base = Image.new("RGB", (120, 100), (84, 112, 148))
+    caster = RemovalTarget("Lamp", Image.new("L", (26, 32), 255), (24, 20))
+    protected = RemovalTarget("Foreground rail", Image.new("L", (5, 15), 255), (60, 42), False, True)
+    tentative = RemovalTarget("Possible shadow", Image.new("L", (12, 12), 255), (54, 50), False, parent=0)
+    shadow = _outline("Cast shadow", [400, 490, 710, 720], view="detail")
+    shading = _outline("Shading on the lamp", [250, 260, 330, 380], view="detail")
+    client = _FakeAnalysis({"effects": [shadow, shading]})
+
+    targets = detect_removal_effects(
+        base, (caster, tentative, protected), Path("codex"), cancelled=Event(), client_factory=client,
+    )
+    assert client.calls == 1 and "Lamp" in client.prompt and targets[:2] == (caster, protected)
+    effect = targets[2]
+    assert effect.label == "Cast shadow" and effect.selected and effect.parent == 0
+    assert effect.origin == (45, 49) and effect.mask.getpixel((22, 10)) == 255
+
+
+def test_effect_pass_for_direct_lasso_rechecks_confirmed_effects_outside_the_lasso():
+    base = Image.new("RGB", (200, 160), (84, 112, 148))
+    lasso = Image.new("L", base.size)
+    lasso.paste(255, (30, 40, 90, 105))
+    caster = RemovalTarget("Lamp", Image.new("L", (30, 40), 255), (34, 50))
+    outside = RemovalTarget("Shadow outside", Image.new("L", (10, 10), 255), (97, 64), parent=0)
+    inside = _outline("Cast shadow", [630, 530, 740, 690], view="detail")
+    other = _outline("Farther cast shadow", [840, 530, 920, 690], view="detail")
+    extension = _outline("Far edge of the shadow", [895, 575, 970, 735], view="detail")
+
+    class Recheck(_FakeAnalysis):
+        def analyze_images(self, prompt, references, schema, *, effort):
+            if self.calls:
+                assert "Include any missed extensions" in prompt and len(references) == 3
+                self.result = {"effects": [extension]}
+            return super().analyze_images(prompt, references, schema)
+
+    client = Recheck({"effects": [inside, other]})
+
+    targets = detect_removal_effects(
+        base, (caster, outside), Path("codex"), cancelled=Event(), lasso=lasso, client_factory=client,
+    )
+    assert client.calls == 2 and targets[:2] == (caster, outside)
+    assert [target.label for target in targets[2:]] == ["Cast shadow", "Farther cast shadow", "Far edge of the shadow"]
+    assert targets[-1].origin[0] >= 90 and targets[-1].parent == 0
+
+
+def test_direct_lasso_checks_for_offset_shadows_even_with_a_confirmed_contact_shadow():
+    base = Image.new("RGB", (200, 160), (84, 112, 148))
+    lasso = Image.new("L", base.size)
+    lasso.paste(255, (30, 40, 90, 105))
+    caster = RemovalTarget("Lamp", Image.new("L", (30, 40), 255), (34, 50))
+    contact = RemovalTarget("Contact shadow", Image.new("L", (10, 6), 255), (40, 90), parent=0)
+    proposal = _outline("Possible pan shadow", [830, 530, 925, 690], view="detail", uncertain=True)
+    revision = _outline("Pan shadow", [815, 500, 940, 720], view="detail")
+
+    class Recheck(_FakeAnalysis):
+        def analyze_images(self, prompt, references, schema, *, effort):
+            assert effort == "high"
+            if self.calls:
+                assert "Image 3 marks areas" in prompt
+                assert references[2].read_bytes() != references[0].read_bytes()
+                self.result = {"effects": [revision]}
+            return super().analyze_images(prompt, references, schema)
+
+    client = Recheck({"effects": [proposal]})
+    targets = detect_removal_effects(
+        base, (caster, contact), Path("codex"), cancelled=Event(), lasso=lasso, client_factory=client,
+    )
+    assert client.calls == 2 and targets[:2] == (caster, contact)
+    assert targets[2].label == "Pan shadow" and targets[2].selected and targets[2].parent == 0
 
 
 def test_detection_guide_preserves_isolated_pixels_during_downsample():
@@ -130,18 +222,16 @@ def test_detection_guide_preserves_isolated_pixels_during_downsample():
     lasso.paste(255, (8, 10, 256, 256))
     lasso.putpixel((8000, 67), 1)
     guide = _guide(base, lasso, Rect(0, 0, *base.size))
-
     assert guide.size == (1024, 32)
     assert guide.getpixel((1000, 8)) != (40, 60, 70)
     assert guide.getpixel((1, 1)) != (40, 60, 70)
-    assert guide.getpixel((600, 5)) == (40, 60, 70)
 
 
-def test_invalid_locations_are_reported_and_cancel_skips_analysis():
+def test_invalid_contours_are_reported_and_cancellation_skips_analysis():
     base = Image.new("RGB", (100, 100))
     lasso = Image.new("L", base.size, 255)
     client = _FakeAnalysis({
-        "targets": [{**_description("Invalid", [-5, 2, 900, 950]), "effects": []}],
+        "targets": [{**_outline("Invalid", [-5, 2, 900, 950]), "effects": []}],
         "protected": [],
     })
     cancel = Event()
@@ -150,132 +240,5 @@ def test_invalid_locations_are_reported_and_cancel_skips_analysis():
         detect_removal(base, lasso, Path("codex"), cancelled=cancel, client_factory=client)
     assert client.calls == 0
     cancel.clear()
-    with pytest.raises(CodexError, match="invalid object locations"):
+    with pytest.raises(CodexError, match="invalid selection"):
         detect_removal(base, lasso, Path("codex"), cancelled=cancel, client_factory=client)
-
-
-class _LocalSegmenter:
-    def candidates(self, image, _foreground):
-        red, green, _blue = np.moveaxis(image, 2, 0)
-        yield red > green, 0.94
-
-
-def test_click_and_tight_lasso_locate_same_object_locally():
-    base = Image.new("RGB", (120, 100), (30, 80, 90))
-    base.paste((220, 55, 25), (36, 24, 90, 68))
-    lasso = Image.new("L", base.size)
-    lasso.paste(255, (29, 18, 96, 73))
-    options = {"cancelled": Event(), "segmenter_factory": _LocalSegmenter}
-
-    (clicked,) = segment_removal_click(base, (65.25, 43.75), **options)
-    (selected,) = segment_removal_lasso(base, lasso, **options)
-
-    assert clicked.selected and selected.selected
-    assert clicked.origin == selected.origin == (36, 24)
-    assert clicked.mask.size == selected.mask.size == (54, 44)
-    assert clicked.mask.tobytes() == selected.mask.tobytes()
-
-
-def test_lasso_with_unexplained_object_defers_even_with_a_confident_main_mask():
-    base = Image.new("RGB", (460, 300), (124, 139, 153))
-    base.paste((175, 55, 35), (70, 64, 271, 231))
-    base.putpixel((303, 138), (75, 173, 57))
-    lasso = Image.new("L", base.size)
-    lasso.paste(255, (63, 58, 344, 236))
-    options = {"cancelled": Event(), "segmenter_factory": _LocalSegmenter}
-    (main,) = segment_removal_lasso(base, lasso, **options)
-    assert main.origin == (70, 64)
-
-    # This second object is inside the same continuous lasso, but the point
-    # segmenter still returns only the large red object under the prompt.
-    base.paste((75, 173, 57), (292, 110, 338, 162))
-    assert segment_removal_lasso(base, lasso, **options) == ()
-
-
-def test_local_detection_defers_ambiguous_point_and_disconnected_lasso():
-    class Ambiguous:
-        def candidates(self, image, _foreground):
-            large = np.zeros(image.shape[:2], dtype=bool)
-            small = large.copy()
-            large[22:78, 25:91] = True
-            small[37:66, 41:72] = True
-            yield large, 0.92
-            yield small, 0.89
-
-    base = Image.new("RGB", (120, 100))
-    options = {"cancelled": Event(), "segmenter_factory": Ambiguous}
-    assert segment_removal_click(base, (52, 50), **options) == ()
-    mask = Image.new("L", base.size)
-    mask.paste(255, (2, 7, 24, 40))
-    mask.paste(255, (66, 24, 100, 66))
-    assert segment_removal_lasso(base, mask, **options) == ()
-
-    tight = Image.new("L", base.size)
-    tight.paste(255, (38, 35, 76, 67))
-    (selected,) = segment_removal_lasso(base, tight, **options)
-    assert selected.origin == (41, 37)
-    assert selected.mask.size == (31, 29)
-
-
-def test_local_detection_requires_agreement_for_lower_confidence():
-    class OneProposal:
-        def candidates(self, image, _foreground):
-            mask = np.zeros(image.shape[:2], dtype=bool)
-            mask[22:78, 25:91] = True
-            yield mask, 0.61
-
-    class MatchingProposals(OneProposal):
-        def candidates(self, image, foreground):
-            yield from super().candidates(image, foreground)
-            mask = np.zeros(image.shape[:2], dtype=bool)
-            mask[23:79, 24:90] = True
-            yield mask, 0.55
-
-    base = Image.new("RGB", (120, 100))
-    point = (52, 50)
-    assert segment_removal_click(base, point, cancelled=Event(), segmenter_factory=OneProposal) == ()
-    (result,) = segment_removal_click(base, point, cancelled=Event(), segmenter_factory=MatchingProposals)
-    assert result.origin == (25, 22)
-
-
-def test_local_detection_defers_potential_translucent_shadow():
-    base = Image.new("RGBA", (120, 100))
-    base.paste((220, 55, 25, 255), (36, 24, 90, 68))
-    options = {"cancelled": Event(), "segmenter_factory": _LocalSegmenter}
-    base.paste((210, 51, 22, 100), (36, 68, 90, 69))
-    assert segment_removal_click(base, (65, 43), **options)
-
-    base.paste((15, 15, 15, 100), (36, 71, 90, 74))
-    assert segment_removal_click(base, (65, 43), **options) == ()
-
-
-def test_local_detection_drops_specks_but_defers_separate_regions():
-    base = Image.new("RGB", (120, 100), (30, 80, 90))
-    base.paste((220, 55, 25), (36, 24, 90, 68))
-    base.putpixel((2, 2), (220, 55, 25))
-    options = {"cancelled": Event(), "segmenter_factory": _LocalSegmenter}
-    (result,) = segment_removal_click(base, (65, 43), **options)
-    assert result.origin == (36, 24)
-    assert result.mask.size == (54, 44)
-
-    base.paste((220, 55, 25), (2, 2, 18, 14))
-    assert segment_removal_click(base, (65, 43), **options) == ()
-
-
-def test_local_detection_skips_transparent_click_and_propagates_cancel():
-    class CancelAfterStart:
-        def candidates(self, image, _foreground):
-            cancel.set()
-            yield np.ones(image.shape[:2], dtype=bool), 0.95
-
-    def should_not_load():
-        pytest.fail("Transparent or out-of-bounds clicks should not load the segmenter")
-
-    base = Image.new("RGBA", (120, 100))
-    base.paste((210, 85, 0, 255), (10, 10, 22, 22))
-    cancel = Event()
-    options = {"cancelled": cancel, "segmenter_factory": should_not_load}
-    assert segment_removal_click(base, (48, 30), **options) == ()
-    assert segment_removal_click(base, (-1, 30), **options) == ()
-    with pytest.raises(Cancelled):
-        segment_removal_click(base, (15, 15), cancelled=cancel, segmenter_factory=CancelAfterStart)

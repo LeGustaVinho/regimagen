@@ -8,7 +8,7 @@ from uuid import uuid4
 from weakref import ref
 
 from PIL import Image
-from PySide6.QtCore import QSignalBlocker, QThreadPool, Qt, Signal
+from PySide6.QtCore import QSignalBlocker, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QShortcut, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
@@ -20,6 +20,7 @@ from .document import Document, Layer, asset_thumbnail, box, paint, paint_mask, 
 from .editor_preview import EditorPreview
 from .editor_tasks import EditorTask
 from .geometry import MAX_PNG_DIMENSION, Rect
+from .periodic import wrap_offset
 
 _SELECTION_CACHE_BYTES = 64 * 1024 * 1024
 
@@ -197,7 +198,14 @@ class Editor(QWidget):
         content.addLayout(tools)
 
         work = QHBoxLayout()
-        work.addWidget(self.canvas, 1)
+        canvas_column = QVBoxLayout()
+        canvas_column.addWidget(self.canvas, 1)
+        self.tool_hint = QLabel()
+        self.tool_hint.setObjectName("muted")
+        self.tool_hint.setTextFormat(Qt.TextFormat.PlainText)
+        self.tool_hint.setWordWrap(True)
+        canvas_column.addWidget(self.tool_hint)
+        work.addLayout(canvas_column, 1)
         work.addWidget(self._layer_panel())
         content.addLayout(work, 1)
         self.message = QLabel()
@@ -336,6 +344,7 @@ class Editor(QWidget):
 
     def set_document(self, document: Document):
         self.canvas.cancel_gesture()
+        self.set_pattern_preview(False)
         if self._edit_task is not None:
             self._edit_task[0].cancelled.set()
             self._edit_task = None
@@ -361,12 +370,111 @@ class Editor(QWidget):
             self.setEnabled(not busy)
             self._tools_changed()
 
+    def set_pattern_preview(self, enabled: bool):
+        self._preview.set_pattern_preview(enabled)
+
+    def offset_layer(self):
+        if self.after_edits(self.offset_layer):
+            return
+        layer, document = self.active_layer, self.document
+        if self._busy or layer is None or layer.locked or not layer.visible:
+            return
+        self.canvas.cancel_gesture()
+        self._preview.end_draft()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Offset")
+        form = QFormLayout(dialog)
+        fields = []
+        for label, extent in zip(("Horizontal (px)", "Vertical (px)"), layer.image.size):
+            field = QSpinBox()
+            field.setRange(-MAX_PNG_DIMENSION, MAX_PNG_DIMENSION)
+            field.setValue(extent // 2)
+            form.addRow(label, field)
+            fields.append(field)
+        form.addRow("Edges", QLabel("Wrap Around"))
+        status = QLabel()
+        status.setWordWrap(True)
+        form.addRow(status)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        apply = buttons.button(QDialogButtonBox.StandardButton.Apply)
+        apply.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        task = None
+        displayed = None
+        desired = None
+        result = layer
+        timer = QTimer(dialog, interval=75, singleShot=True)
+
+        def finished(worker, shifted, error):
+            nonlocal task, displayed, result
+            if task is None or worker is not task[0] or not dialog.isVisible():
+                return
+            _, offsets = task
+            task = None
+            if offsets != desired:
+                timer.start()
+                return
+            if error:
+                status.setText(error)
+                return
+            displayed, result = offsets, shifted
+            status.clear()
+            self._preview.set_document(document.update(result) if result is not layer else document)
+            apply.setEnabled(True)
+
+        def preview():
+            nonlocal task
+            if task is not None:
+                return
+            if displayed == desired:
+                status.clear()
+                apply.setEnabled(True)
+                return
+            dx, dy = desired
+            worker = EditorTask(
+                lambda _cancelled: layer.transform(lambda image: wrap_offset(image, dx, dy)) if dx or dy else layer,
+            )
+            task = worker, desired
+            worker.signals.finished.connect(finished, Qt.ConnectionType.QueuedConnection)
+            QThreadPool.globalInstance().start(worker)
+
+        def changed():
+            nonlocal desired
+            desired = tuple(field.value() % extent for field, extent in zip(fields, layer.image.size))
+            apply.setEnabled(False)
+            status.setText("Updating preview…")
+            timer.start()
+
+        timer.timeout.connect(preview)
+        for field in fields:
+            field.valueChanged.connect(changed)
+        changed()
+        try:
+            accepted = dialog.exec()
+        finally:
+            timer.stop()
+            if task is not None:
+                task[0].cancelled.set()
+                task = None
+            self._preview.set_document(document)
+            dialog.deleteLater()
+        if accepted and displayed == desired and result is not layer and self.document is document:
+            self._edit_layer("Offset", layer.id, lambda _state, _layer: result)
+
     def set_message(self, text: str):
         self.message.setText(text)
         self.message.setVisible(bool(text))
 
     def add_image(self, image: Image.Image, name: str):
         self._insert("Import layer", lambda _state: Layer(name, image if image.mode == "RGBA" else image.convert("RGBA")))
+
+    def apply_pattern(self, document: Document, layer_id: str, source: Document) -> bool:
+        if self.document is not source or self.edits_pending:
+            return False
+        self._submit("Pattern Seam Repair", lambda state: _State(document, layer_id, state.selection))
+        return self.document is document
 
     def apply_fill(self, document: Document, layer_id: str, selection: Image.Image):
         layer = document.layer(layer_id)
@@ -377,6 +485,9 @@ class Editor(QWidget):
             self._submit(
                 label, lambda _state: _State(document, layer_id, _Selection.prepare(selection)), background=True,
             )
+
+    def apply_removal(self, document: Document, layer_id: str):
+        self._submit("Generative Remove", lambda _state: _State(document, layer_id, None))
 
     def _submit(self, label, update, *, background=False, keep_gesture=False):
         if self._state is not None:
@@ -738,6 +849,21 @@ class Editor(QWidget):
         can_paint = editable and (layer.mask is not None if editing_mask else layer.coverage is None)
         can_draw = tool in SELECTION_TOOLS or (editable and tool == "move") or (painting and can_paint)
         self.canvas.set_drawing_enabled(not self._busy and can_draw)
+        hint = ""
+        if self.document is not None and not self._busy and not can_draw and (painting or tool == "move"):
+            if layer is None:
+                action = "Select a layer in Layers" if self.document.layers else "Add a layer"
+                hint = f"{action} to use {self.tool.currentText()}."
+            elif not layer.visible:
+                hint = f"Turn on visibility for “{layer.name}” in Layers."
+            elif layer.locked:
+                hint = f"Turn off Lock layer to edit “{layer.name}”."
+            elif layer.mask is not None:
+                hint = "Turn on Paint mask or select a raster layer to paint pixels."
+            else:
+                hint = "Add a layer mask or select a raster layer to paint pixels."
+        self.tool_hint.setText(hint)
+        self.tool_hint.setVisible(bool(hint))
         self.selection_mode.setVisible(tool in SELECTION_TOOLS)
         self.clear_button.setEnabled(self.selection is not None)
         selection = self._state.selection if self._state is not None else None

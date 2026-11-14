@@ -7,7 +7,10 @@ import pytest
 from PIL import Image, ImageDraw
 
 from regimagen.codex import Cancelled, GeneratedImage
+from regimagen.document_fill import removed_object_layers
 from regimagen.fill import FillCandidate, generate_remove, removal_alpha_mask, render_remove
+from regimagen.remove_detection import RemovalTarget
+from regimagen.remove_editor import removal_masks
 
 
 class _Capture:
@@ -61,10 +64,49 @@ def test_prepared_references_hide_object_including_repeated_virtual_edges():
     raw_prompt, raw_images = capture.requests[0]
     prepared_prompt, prepared_images = capture.requests[1]
     assert "original square crop" in raw_prompt
+    assert "amber outline" in raw_prompt
+    assert np.any(np.all(np.asarray(raw_images[1]) == (255, 174, 47), axis=2))
     assert "background approximation" in prepared_prompt
     assert all(shows_red(image) for image in raw_images)
     assert not any(shows_red(image) for image in prepared_images)
     assert prepared_images[1].tobytes() != prepared_images[0].tobytes()
+
+
+def test_direct_lasso_sends_visible_subject_even_on_a_retry():
+    base = Image.new("RGB", (80, 80), (24, 117, 81))
+    base.paste((255, 0, 0), (29, 27, 49, 51))
+    core = Image.new("L", base.size)
+    core.paste(255, (29, 27, 49, 51))
+    capture = _Capture()
+
+    generate_remove(base, core, core, ("Red object",), Path("codex"), cancelled=Event(),
+                    client_factory=capture, prepare=True, direct=True)
+
+    [(prompt, references)] = capture.requests
+    assert "approved edit area" in prompt and "original square crop" in prompt
+    assert "Red object" in prompt
+    assert np.any(np.all(np.asarray(references[0]) == (255, 0, 0), axis=2))
+
+
+def test_removed_objects_keep_source_alpha_and_assign_shared_pixels_in_review_order():
+    source = Image.new("RGBA", (18, 16), (0, 0, 0, 0))
+    source.paste((92, 130, 185, 141), (3, 3, 15, 13))
+    approved = Image.new("L", source.size, 255)
+    approved.putpixel((5, 5), 0)
+    first = RemovalTarget("First", Image.new("L", (9, 8), 255), (1, 1))
+    second = RemovalTarget("Second", Image.new("L", (9, 9), 255), (7, 4))
+    duplicate = RemovalTarget("Duplicate", first.mask, first.origin)
+
+    a, b = removed_object_layers(source, approved, (first, second, duplicate), cancelled=Event())
+
+    assert (a.x, a.y, a.image.size) == (3, 3, (7, 6))
+    assert a.image.getpixel((0, 0)) == (92, 130, 185, 141)
+    assert a.image.getpixel((2, 2)) == (0, 0, 0, 0)
+    assert (b.x, b.y, b.image.size) == (7, 4, (8, 9))
+    assert b.image.getpixel((0, 0)) == (0, 0, 0, 0)
+    assert b.image.getpixel((3, 0)) == (92, 130, 185, 141)
+    assert b.image.getpixel((0, 5)) == (92, 130, 185, 141)
+    assert a.visible and b.visible and a.coverage is None and b.coverage is None
 
 
 def test_approved_footprint_and_protected_hole_are_exact_at_source_resolution():
@@ -85,6 +127,36 @@ def test_approved_footprint_and_protected_hole_are_exact_at_source_resolution():
     assert 0 < output[13, 13, 2] < 255
 
 
+def test_removal_matches_local_tones_on_both_sides_of_textured_background():
+    y, x = np.indices((256, 256))
+    texture = np.where((x + 2 * y) % 14 < 2, -18, 4)
+    illumination = 133 + y // 16
+    background = (illumination + texture).astype(np.uint8)
+    base = Image.fromarray(background).convert("RGB")
+    base.paste((255, 0, 0), (64, 64, 192, 192))
+    core = Image.new("L", base.size)
+    core.paste(255, (64, 64, 192, 192))
+    footprint = Image.new("L", base.size)
+    footprint.paste(255, (49, 49, 207, 207))
+    # The generated texture is shifted, with opposite tonal drift on the two sides.
+    restored = illumination + np.roll(texture, 4, axis=1)
+    drift = np.where(x < 128, 20, -20)
+    generated = Image.fromarray((restored + drift).astype(np.uint8)).convert("RGB")
+
+    preview = render_remove(base, core, footprint, _candidate(generated, feather=12))
+    output = np.asarray(preview.compose(base))
+    approved = np.asarray(footprint) != 0
+    np.testing.assert_array_equal(output[~approved], np.asarray(base)[~approved])
+    # The old red object must not leak into the texture filter near the join.
+    np.testing.assert_array_equal(output[approved, 0], output[approved, 1])
+    for column in (64, 191):
+        error = output[96:160, column, 0] - restored[96:160, column]
+        assert np.mean(np.abs(error)) < 17
+    # On the outer part of the band, the original grooves retain their contrast.
+    fringe = output[96:160, 56, 0].astype(np.int16) - background[96:160, 56]
+    assert np.std(fringe) < 1
+
+
 def test_isolated_target_restores_clear_alpha_even_with_opaque_generated_patch():
     base = Image.new("RGBA", (48, 48), (120, 200, 42, 0))
     base.paste((220, 100, 42, 225), (16, 16, 32, 32))
@@ -98,13 +170,6 @@ def test_isolated_target_restores_clear_alpha_even_with_opaque_generated_patch()
     assert not output[..., 3].any()
     protected = np.asarray(footprint) == 0
     np.testing.assert_array_equal(output[protected], np.asarray(base)[protected])
-
-    # One real nontransparent neighbor is enough to make it ambiguous.
-    base.putpixel((13, 20), (110, 110, 110, 1))
-    mixed = render_remove(base, core, footprint, generated).compose(base)
-    assert mixed.getpixel((16, 16)) == (32, 50, 90, 255)
-    assert mixed.getpixel((13, 20)) == (110, 110, 110, 1)
-
 
 def test_fully_clear_removal_never_looks_up_or_calls_imagegen():
     base = Image.new("RGBA", (64, 64), (90, 70, 40, 0))
@@ -128,6 +193,27 @@ def test_fully_clear_removal_never_looks_up_or_calls_imagegen():
     assert output.getchannel("A").getbbox() is None
     outside = np.asarray(footprint) == 0
     np.testing.assert_array_equal(np.asarray(output)[outside], np.asarray(base)[outside])
+
+
+def test_clear_background_preserves_a_visible_neighbor_in_the_blending_band():
+    base = Image.new("RGBA", (140, 110))
+    base.paste((215, 70, 10, 255), (18, 22, 68, 72))
+    base.paste((25, 170, 215, 141), (69, 24, 70, 64))
+    target = RemovalTarget("Selected", Image.new("L", (50, 50), 255), (18, 22))
+    inputs = removal_masks(base.size, (target,), opaque=False)
+    neighbor = (69, 30)
+    assert inputs.core.getpixel(neighbor) == 0 and inputs.footprint.getpixel(neighbor) == 255
+
+    def resolve():
+        pytest.fail("An isolated target can still be cleared without ImageGen")
+
+    candidate = generate_remove(base, inputs.core, inputs.footprint, inputs.labels, resolve, cancelled=Event())
+    output = render_remove(base, inputs.core, inputs.footprint, candidate).compose(base)
+
+    expected = base.copy()
+    expected.paste((0, 0, 0, 0), (18, 22, 68, 72))
+    assert candidate.metadata["generation_backend"] == "alpha"
+    assert output.tobytes() == expected.tobytes()
 
 
 def test_attached_target_is_cleared_before_imagegen_but_visible_mount_is_reconstructed():

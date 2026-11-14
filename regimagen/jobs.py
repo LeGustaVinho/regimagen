@@ -318,6 +318,11 @@ def _file_sha256(path: Path) -> str | None:
         return None
 
 
+def _check_batch_output(destination: Path, current_hash: str | None, published_hash: str | None):
+    if current_hash is not None and current_hash != published_hash:
+        raise FileExistsError(f"“{destination.name}” already exists in the output folder.")
+
+
 def _scale_cache_digest(layout, artifacts, cache, alpha, cancelled) -> str:
     checksum = cache.with_suffix(".sha256")
     recorded_hash = _stage_checksum(cache)
@@ -351,6 +356,7 @@ def run_scale_batch(
     published: dict[int, tuple[str, str]] | None = None,
     on_published: Callable[[Job, Path, str, str], None] | None = None,
     on_outcome: Callable[[RunOutcome], None] = lambda _: None,
+    protect_outputs: bool = False,
 ) -> tuple[Path, int, int]:
     stem = Path(source.name).stem
     if folder is None:
@@ -396,23 +402,41 @@ def run_scale_batch(
         identity = [job.id, *(artifacts[cell].name for cell in job.layout.cells)]
         output_revision = sha256("\n".join(identity).encode("ascii")).hexdigest()
         previous_revision, previous_hash = publications.get(job.scale, (None, None))
-        expected_hash = previous_hash if previous_revision == output_revision else None
-        if index + 1 < len(layouts) and layouts[index + 1].input_scale == job.scale:
+        chained = index + 1 < len(layouts) and layouts[index + 1].input_scale == job.scale
+        if chained:
             # Published attempts have immutable names. Regenerating a tile changes
             # the input revision and creates a separate job for the next stage.
             revision = output_revision
             cache = source.scale_result_path(revision)
             digest = _scale_cache_digest(job.layout, artifacts, cache, alpha, cancelled)
-            if _file_sha256(destination) != digest:
-                with cache.open("rb") as stream, atomic_output(destination) as output:
+        else:
+            digest = previous_hash if previous_revision == output_revision else None
+        current_hash = _file_sha256(destination) if protect_outputs or digest else None
+        if not digest or current_hash != digest:
+            before_publish = None
+            if protect_outputs and current_hash is not None:
+                _check_batch_output(destination, current_hash, previous_hash)
+
+                def verify_output(_temporary):
+                    _check_batch_output(destination, _file_sha256(destination), previous_hash)
+                    if cancelled.is_set():
+                        raise Cancelled("Export canceled.")
+
+                before_publish = verify_output
+            overwrite = not protect_outputs or current_hash is not None
+            if chained:
+                with cache.open("rb") as stream, atomic_output(
+                    destination, overwrite=overwrite, before_publish=before_publish,
+                ) as output:
                     copyfileobj(stream, output)
                     if cancelled.is_set():
                         raise Cancelled("Export canceled.")
-        elif expected_hash and _file_sha256(destination) == expected_hash:
-            digest = expected_hash
-        else:
-            export_png(job.layout, artifacts, destination, alpha=alpha, cancelled=cancelled.is_set)
-            digest = _file_sha256(destination) if on_published is not None else None
+            else:
+                export_png(
+                    job.layout, artifacts, destination, alpha=alpha, cancelled=cancelled.is_set,
+                    overwrite=overwrite, before_publish=before_publish,
+                )
+                digest = _file_sha256(destination) if on_published is not None else None
         completed += 1
         if on_published is not None:
             if digest is None:

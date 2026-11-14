@@ -1,12 +1,15 @@
 """Adapt the generative fill engine to a layered document."""
 
 from dataclasses import dataclass, replace
+from threading import Event
 
-from PIL import Image
+from PIL import Image, ImageChops
 
+from .codex import Cancelled
 from .document import Document, Layer, box, paste_pixels, render
 from .fill import FillPreview
 from .geometry import Rect
+from .remove_detection import RemovalTarget
 
 
 def fill_reference(image: Image.Image) -> Image.Image:
@@ -38,18 +41,86 @@ class LayeredVariant:
     preview: FillPreview
 
 
+@dataclass(frozen=True, kw_only=True)
+class RemovalVariant(LayeredVariant):
+    background: FillPreview
+
+
+def removed_object_layers(
+    source: Image.Image, core: Image.Image, objects: tuple[RemovalTarget, ...], *, cancelled: Event,
+) -> tuple[Layer, ...]:
+    """Extract each visible object from the original composition in review order."""
+    area = core.getbbox()
+    if area is None:
+        return ()
+    origin = Rect(*area)
+    available = core.crop(area)
+    layers = []
+    for target in objects:
+        if cancelled.is_set():
+            raise Cancelled("Removal canceled.")
+        x, y = target.origin
+        bounds = Rect(x, y, x + target.mask.width, y + target.mask.height)
+        overlap = bounds.intersect(origin)
+        if overlap is None:
+            continue
+        region = box(overlap.relative_to(origin))
+        subject = target.mask.crop(box(overlap.relative_to(bounds))).point([0] + [255] * 255)
+        mask = ImageChops.darker(available.crop(region), subject)
+        selected = mask.getbbox()
+        if selected is None:
+            continue
+        x, y = overlap.left, overlap.top
+        left, top, right, bottom = selected
+        patch = source.crop((x + left, y + top, x + right, y + bottom)).convert("RGBA")
+        alpha = ImageChops.multiply(patch.getchannel("A"), mask.crop(selected))
+        visible = alpha.getbbox()
+        if visible is None:
+            continue
+        patch.putalpha(alpha)
+        patch = patch.crop(visible)
+        clear = patch.getchannel("A").point([255] + [0] * 255)
+        patch.paste((0, 0, 0, 0), (0, 0, *patch.size), clear)
+        layers.append(Layer(target.label, patch, x + left + visible[0], y + top + visible[1]))
+        available.paste(0, region, mask)
+    if cancelled.is_set():
+        raise Cancelled("Removal canceled.")
+    return tuple(layers)
+
+
+def removal_variant(
+    document: Document, footprint: Image.Image, preview: FillPreview, objects: tuple[Layer, ...], *,
+    cancelled: Event,
+) -> RemovalVariant:
+    background = layered_variant(document, footprint, preview, None, name="Generative Remove")
+    document = replace(background.document, layers=background.document.layers + objects)
+    x, y = background.preview.origin
+    width, height = background.preview.patch.size
+    after = render(document, Rect(x, y, x + width, y + height), cancelled=cancelled.is_set)
+    return RemovalVariant(
+        document, objects[-1].id, FillPreview(after, (x, y), preview.warning), background=background.preview,
+    )
+
+
+def replacement_layer(
+    selection: Image.Image, patch: Image.Image, origin: tuple[int, int], name: str, *, isolated: bool = False,
+) -> Layer:
+    left, top = origin
+    area = left, top, left + patch.width, top + patch.height
+    # The patch already includes the blend. Coverage also replaces fully transparent pixels.
+    coverage = None if isolated else selection.crop(area).point([0] + [255] * 255)
+    return Layer(name, patch if patch.mode == "RGBA" else patch.convert("RGBA"), left, top, coverage=coverage)
+
+
 def layered_variant(
     document: Document, selection: Image.Image, preview: FillPreview, target: ActiveFillTarget | None,
-    *, name: str = "Generative Fill",
+    *, name: str = "Generative Fill", isolated_layer: bool = False,
 ) -> LayeredVariant:
     left, top = preview.origin
     patch = preview.patch.convert("RGBA")
     area = Rect(left, top, left + patch.width, top + patch.height)
     if target is None:
-        # The engine already feathered the pixels. Coverage identifies exactly
-        # where to replace the composite, including pixels with alpha zero.
-        coverage = selection.crop(box(area)).point([0] + [255] * 255)
-        layer = Layer(name, patch, left, top, coverage=coverage)
+        layer = replacement_layer(selection, patch, (left, top), name, isolated=isolated_layer)
         document = document.insert(layer)
     else:
         layer = target.layer
