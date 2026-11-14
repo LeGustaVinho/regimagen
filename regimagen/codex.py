@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import __version__
@@ -51,6 +51,8 @@ class GeneratedImage:
     data: bytes
     generation_id: str | None
     references_verified: bool | None = None
+    transparent_background: bool = False
+    final_message: str = ""
 
 
 def _verify_reference_hashes(observed: object, expected: tuple[str, ...]) -> bool | None:
@@ -250,6 +252,7 @@ class CodexClient:
         self, prompt: str, references: tuple[Path, ...] = (), *,
         on_image: Callable[[GeneratedImage], None] | None = None,
         verify_references: bool = False,
+        output_schema: dict | None = None,
     ) -> GeneratedImage:
         attachments = [{"type": "localImage", "path": str(path.resolve())} for path in references]
         expected_hashes = (
@@ -261,6 +264,7 @@ class CodexClient:
             lambda thread, turn, events: self._wait_image(
                 thread, turn, events, references, on_image=on_image, expected_hashes=expected_hashes,
             ),
+            output_schema=output_schema,
         )
 
     def generate_delegated(
@@ -286,14 +290,22 @@ class CodexClient:
             effort="low",
         )
 
-    def analyze_images(self, prompt: str, references: tuple[Path, ...], schema: dict) -> dict:
+    def analyze_images(
+        self, prompt: str, references: tuple[Path, ...], schema: dict, *, effort: str | None = None,
+        subject: str = "object detection",
+    ) -> dict:
         attachments = [{"type": "localImage", "path": str(path.resolve())} for path in references]
+        options = {"effort": effort} if effort else {}
+
+        def wait(thread, turn, events):
+            return self._wait_analysis(thread, turn, events, subject=subject)
+
         return self._run_turn(
-            [{"type": "text", "text": prompt}, *attachments], self._wait_analysis,
-            output_schema=schema,
+            [{"type": "text", "text": prompt}, *attachments], wait,
+            output_schema=schema, **options,
         )
 
-    def _wait_analysis(self, thread_id: str, turn_id: str, events: list[dict]) -> dict:
+    def _wait_analysis(self, thread_id: str, turn_id: str, events: list[dict], *, subject: str = "object detection") -> dict:
         deadline = time.monotonic() + self.timeout
         early = iter(events)
         answer = ""
@@ -313,7 +325,7 @@ class CodexClient:
             if message.get("method") != "turn/completed" or turn.get("id") != turn_id:
                 continue
             if turn.get("status") == "interrupted":
-                raise Cancelled("Object detection canceled.")
+                raise Cancelled(f"{subject.capitalize()} canceled.")
             if turn.get("status") != "completed":
                 _raise_codex_error(turn.get("error") or {})
             try:
@@ -322,7 +334,7 @@ class CodexClient:
                     return result
             except (TypeError, ValueError):
                 pass
-            raise CodexError("Codex returned invalid object detection data. Try again or use the selection manually.")
+            raise CodexError(f"Codex returned invalid {subject} data. Try again or use the selection manually.")
 
     def _run_turn(
         self, inputs: list[dict], wait: Callable, *, effort: str | None = None, output_schema: dict | None = None,
@@ -377,6 +389,7 @@ class CodexClient:
         deadline = time.monotonic() + self.timeout
         saved: GeneratedImage | None = None
         diagnostic = ""
+        final_message = ""
         early = iter(events)
         while True:
             message = next(early, None)
@@ -402,6 +415,8 @@ class CodexClient:
                         diagnostic = f"ImageGen: {item.get('status', 'failed')}"
                 elif item.get("type") == "agentMessage":
                     diagnostic = item.get("text", "")[:600]
+                    if item.get("phase") in (None, "final_answer", "finalAnswer"):
+                        final_message = diagnostic
             if method == "error" and params.get("turnId") == turn_id:
                 if not params.get("willRetry"):
                     _raise_codex_error(params.get("error") or {}, error_type=ImageTurnRejected)
@@ -417,7 +432,7 @@ class CodexClient:
                         "The turn ended without an ImageGen edit."
                         + (f" {diagnostic}" if diagnostic else "")
                     )
-                return saved
+                return replace(saved, final_message=final_message)
 
     def _wait_delegated(self, thread_id, turn_id, events, requests, on_image):
         deadline = time.monotonic() + self.timeout
@@ -506,7 +521,8 @@ class CodexClient:
                 pass
         if not 0 < len(data) <= MAX_IMAGE_BYTES:
             raise CodexError("The ImageGen event did not provide an accessible image file.")
-        return GeneratedImage(data, item.get("generationId"), references_verified)
+        return GeneratedImage(data, item.get("generationId"), references_verified,
+                              transparent_background=item.get("transparentBackground") is True)
 
 
 def _raise_codex_error(error: dict, fallback: str = "", *, error_type: type[CodexError] = CodexError):

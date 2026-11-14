@@ -1,22 +1,28 @@
 """The layered document editor and its undoable canvas tools."""
 
 import math
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from uuid import uuid4
+from weakref import ref
 
-import numpy as np
 from PIL import Image
-from PySide6.QtCore import QObject, QRectF, QRunnable, QSignalBlocker, QThreadPool, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QKeySequence, QPixmap, QShortcut, QUndoCommand, QUndoStack
+from PySide6.QtCore import QSignalBlocker, QThreadPool, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QShortcut, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QListWidget, QListWidgetItem, QMenu, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from .canvas import CanvasView, SELECTION_TOOLS, combine_selection, pixmap
-from .document import Document, Layer, asset_thumbnail, box, paint, paint_mask, render, validate_size
+from .canvas import CanvasView, SELECTION_TOOLS, combine_selection, pixmap, selection_overlay
+from .document import Document, Layer, asset_thumbnail, box, paint, paint_mask, validate_size
+from .editor_preview import EditorPreview
+from .editor_tasks import EditorTask
 from .geometry import MAX_PNG_DIMENSION, Rect
-from .viewer import qimage
+from .periodic import wrap_offset
+
+_SELECTION_CACHE_BYTES = 64 * 1024 * 1024
 
 
 def _button(text, slot, *, tip=None):
@@ -69,69 +75,45 @@ def dimensions(parent, title, size, *, preserve_aspect=False):
     return (width.value(), height.value()) if dialog.exec() else None
 
 
+@dataclass(eq=False)
+class _Selection:
+    mask: Image.Image
+    bounds: tuple[int, int, int, int]
+    overlay: QImage | None
+
+    @classmethod
+    def prepare(cls, mask):
+        bounds = mask.getbbox() if mask is not None else None
+        return cls(mask, bounds, selection_overlay(mask, bounds)) if bounds is not None else None
+
+
 @dataclass(frozen=True)
 class _State:
     document: Document
     active_id: str | None
-    selection: Image.Image | None = None
+    selection: _Selection | None = None
+
+
+@dataclass(frozen=True)
+class _LocalEdit:
+    label: str
+    update: Callable[[_State], _State | None]
+    background: bool = False
+    keep_gesture: bool = False
 
 
 class _Edit(QUndoCommand):
-    def __init__(self, label, before, after, show):
+    def __init__(self, label, before, after, show, *, keep_gesture=False):
         super().__init__(label)
         self.before, self.after, self.show = before, after, show
+        self.keep_gesture = keep_gesture
 
     def undo(self):
         self.show(self.before)
 
     def redo(self):
-        self.show(self.after)
-
-
-class _PreviewSignals(QObject):
-    finished = Signal(object, object, str)
-
-
-class _Preview(QRunnable):
-    def __init__(self, request):
-        super().__init__()
-        self.request = request
-        self.signals = _PreviewSignals()
-
-    def run(self):
-        document, area, size = self.request
-        try:
-            image = qimage(np.asarray(self._render(document, area, size)))
-        except Exception as exc:
-            self.signals.finished.emit(self.request, None, str(exc))
-        else:
-            self.signals.finished.emit(self.request, image, "")
-
-    @staticmethod
-    def _render(document, area, size):
-        if (area.width, area.height) == size:
-            return render(document, area)
-        # Resample stripes of the full-resolution composite. Include the
-        # Lanczos support around each stripe so their boundaries match.
-        ratio = area.height / size[1]
-        padding = math.ceil(3 * max(1, ratio))
-        step = max(1, int(2_000_000 / (area.width * ratio)))
-        result = Image.new("RGBA", size)
-        for top in range(0, size[1], step):
-            bottom = min(top + step, size[1])
-            first = area.top + top * ratio
-            last = area.top + bottom * ratio
-            region = Rect(
-                area.left, max(area.top, math.floor(first) - padding),
-                area.right, min(area.bottom, math.ceil(last) + padding),
-            )
-            pixels = render(document, region)
-            scaled = pixels.resize(
-                (size[0], bottom - top), Image.Resampling.LANCZOS,
-                box=(0, first - region.top, area.width, min(region.height, last - region.top)),
-            )
-            result.paste(scaled, (0, top))
-        return result
+        self.show(self.after, keep_gesture=self.keep_gesture)
+        self.keep_gesture = False
 
 
 class Editor(QWidget):
@@ -145,14 +127,19 @@ class Editor(QWidget):
         super().__init__()
         self._state: _State | None = None
         self._saved: Document | None = None
-        self._draft: Document | None = None
         self._busy = False
         self._points = []
         self._start = None
         self._ink = QColor("#8ce1c6")
+        self._items = {}
         self._thumbnails = {}
-        self._preview_running = False
-        self._shown = None
+        self._edits = deque()
+        self._after_edits = deque()
+        self._edit_task = None
+        self._draining_edits = False
+        self._overlay_task = None
+        self._selection_cache = OrderedDict()
+        self._selection_bytes = 0
         self.undo = QUndoStack(self)
         self.undo.setUndoLimit(50)
         self.canvas = CanvasView()
@@ -162,21 +149,16 @@ class Editor(QWidget):
         self.canvas.pointer_moved.connect(self._pointer_move)
         self.canvas.pointer_finished.connect(self._pointer_end)
         self.canvas.gesture_canceled.connect(self._reset_gesture)
-        self.canvas.moved.connect(self._queue_preview)
-        self.canvas.resized.connect(self._queue_preview)
-        self._timer = QTimer(self)
-        self._timer.setSingleShot(True)
-        self._timer.setInterval(16)
-        self._timer.timeout.connect(self._render_preview)
+        self._preview = EditorPreview(self.canvas, self.set_message, self)
         self._build()
 
     def _build(self):
         content = QVBoxLayout(self)
         content.setContentsMargins(0, 0, 0, 0)
         tools = QHBoxLayout()
-        self.undo_button = _button("Undo", self.undo.undo, tip="Undo (Ctrl+Z)")
-        self.redo_button = _button("Redo", self.undo.redo, tip="Redo (Ctrl+Y)")
-        self.undo.canUndoChanged.connect(self.undo_button.setEnabled)
+        self.undo_button = _button("Undo", lambda: self._history_step(self.undo.undo), tip="Undo (Ctrl+Z)")
+        self.redo_button = _button("Redo", lambda: self._history_step(self.undo.redo), tip="Redo (Ctrl+Y)")
+        self.undo.canUndoChanged.connect(self._sync_undo_button)
         self.undo.canRedoChanged.connect(self.redo_button.setEnabled)
         self.undo_button.setEnabled(False)
         self.redo_button.setEnabled(False)
@@ -185,7 +167,7 @@ class Editor(QWidget):
         for key, slot in (("Ctrl+Z", self.undo.undo), ("Ctrl+Y", self.undo.redo), ("Ctrl+Shift+Z", self.undo.redo)):
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            shortcut.activated.connect(slot)
+            shortcut.activated.connect(lambda operation=slot: self._history_step(operation))
         self.tool = QComboBox()
         self.tool.setAccessibleName("Canvas tool")
         for label, value in (
@@ -216,7 +198,14 @@ class Editor(QWidget):
         content.addLayout(tools)
 
         work = QHBoxLayout()
-        work.addWidget(self.canvas, 1)
+        canvas_column = QVBoxLayout()
+        canvas_column.addWidget(self.canvas, 1)
+        self.tool_hint = QLabel()
+        self.tool_hint.setObjectName("muted")
+        self.tool_hint.setTextFormat(Qt.TextFormat.PlainText)
+        self.tool_hint.setWordWrap(True)
+        canvas_column.addWidget(self.tool_hint)
+        work.addLayout(canvas_column, 1)
         work.addWidget(self._layer_panel())
         content.addLayout(work, 1)
         self.message = QLabel()
@@ -336,18 +325,36 @@ class Editor(QWidget):
 
     @property
     def selection(self) -> Image.Image | None:
-        return self._state.selection if self._state else None
+        selection = self._state.selection if self._state else None
+        return selection.mask if selection is not None else None
 
     @property
     def dirty(self) -> bool:
         return self.document is not self._saved
 
+    @property
+    def edits_pending(self) -> bool:
+        return self._edit_task is not None or bool(self._edits)
+
+    def after_edits(self, operation) -> bool:
+        if self.edits_pending:
+            self._after_edits.append(operation)
+            return True
+        return False
+
     def set_document(self, document: Document):
         self.canvas.cancel_gesture()
+        self.set_pattern_preview(False)
+        if self._edit_task is not None:
+            self._edit_task[0].cancelled.set()
+            self._edit_task = None
+        self._edits.clear()
+        self._after_edits.clear()
         self.undo.clear()
+        self._sync_undo_button()
+        self._selection_cache.clear()
+        self._selection_bytes = 0
         self._saved = document
-        self._thumbnails.clear()
-        self._shown = None
         self._state = None
         self.set_message("")
         top = document.layers[-1].id if document.layers else None
@@ -358,64 +365,301 @@ class Editor(QWidget):
         self.changed.emit()
 
     def set_busy(self, busy: bool):
-        self._busy = busy
-        self.setEnabled(not busy)
-        self._tools_changed()
+        if self._busy != busy:
+            self._busy = busy
+            self.setEnabled(not busy)
+            self._tools_changed()
+
+    def set_pattern_preview(self, enabled: bool):
+        self._preview.set_pattern_preview(enabled)
+
+    def offset_layer(self):
+        if self.after_edits(self.offset_layer):
+            return
+        layer, document = self.active_layer, self.document
+        if self._busy or layer is None or layer.locked or not layer.visible:
+            return
+        self.canvas.cancel_gesture()
+        self._preview.end_draft()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Offset")
+        form = QFormLayout(dialog)
+        fields = []
+        for label, extent in zip(("Horizontal (px)", "Vertical (px)"), layer.image.size):
+            field = QSpinBox()
+            field.setRange(-MAX_PNG_DIMENSION, MAX_PNG_DIMENSION)
+            field.setValue(extent // 2)
+            form.addRow(label, field)
+            fields.append(field)
+        form.addRow("Edges", QLabel("Wrap Around"))
+        status = QLabel()
+        status.setWordWrap(True)
+        form.addRow(status)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        apply = buttons.button(QDialogButtonBox.StandardButton.Apply)
+        apply.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        task = None
+        displayed = None
+        desired = None
+        result = layer
+        timer = QTimer(dialog, interval=75, singleShot=True)
+
+        def finished(worker, shifted, error):
+            nonlocal task, displayed, result
+            if task is None or worker is not task[0] or not dialog.isVisible():
+                return
+            _, offsets = task
+            task = None
+            if offsets != desired:
+                timer.start()
+                return
+            if error:
+                status.setText(error)
+                return
+            displayed, result = offsets, shifted
+            status.clear()
+            self._preview.set_document(document.update(result) if result is not layer else document)
+            apply.setEnabled(True)
+
+        def preview():
+            nonlocal task
+            if task is not None:
+                return
+            if displayed == desired:
+                status.clear()
+                apply.setEnabled(True)
+                return
+            dx, dy = desired
+            worker = EditorTask(
+                lambda _cancelled: layer.transform(lambda image: wrap_offset(image, dx, dy)) if dx or dy else layer,
+            )
+            task = worker, desired
+            worker.signals.finished.connect(finished, Qt.ConnectionType.QueuedConnection)
+            QThreadPool.globalInstance().start(worker)
+
+        def changed():
+            nonlocal desired
+            desired = tuple(field.value() % extent for field, extent in zip(fields, layer.image.size))
+            apply.setEnabled(False)
+            status.setText("Updating preview…")
+            timer.start()
+
+        timer.timeout.connect(preview)
+        for field in fields:
+            field.valueChanged.connect(changed)
+        changed()
+        try:
+            accepted = dialog.exec()
+        finally:
+            timer.stop()
+            if task is not None:
+                task[0].cancelled.set()
+                task = None
+            self._preview.set_document(document)
+            dialog.deleteLater()
+        if accepted and displayed == desired and result is not layer and self.document is document:
+            self._edit_layer("Offset", layer.id, lambda _state, _layer: result)
 
     def set_message(self, text: str):
         self.message.setText(text)
         self.message.setVisible(bool(text))
 
     def add_image(self, image: Image.Image, name: str):
-        self._insert(Layer(name, image.convert("RGBA")), "Import layer")
+        self._insert("Import layer", lambda _state: Layer(name, image if image.mode == "RGBA" else image.convert("RGBA")))
+
+    def apply_pattern(self, document: Document, layer_id: str, source: Document) -> bool:
+        if self.document is not source or self.edits_pending:
+            return False
+        self._submit("Pattern Seam Repair", lambda state: _State(document, layer_id, state.selection))
+        return self.document is document
 
     def apply_fill(self, document: Document, layer_id: str, selection: Image.Image):
         layer = document.layer(layer_id)
-        self._commit(layer.name if layer is not None and layer.coverage is not None else "Generative Fill",
-                     _State(document, layer_id, selection))
+        label = layer.name if layer is not None and layer.coverage is not None else "Generative Fill"
+        if selection is self.selection:
+            self._submit(label, lambda state: _State(document, layer_id, state.selection))
+        else:
+            self._submit(
+                label, lambda _state: _State(document, layer_id, _Selection.prepare(selection)), background=True,
+            )
 
-    def _commit(self, label: str, state: _State):
-        self.undo.push(_Edit(label, self._state, state, self._restore))
+    def apply_removal(self, document: Document, layer_id: str):
+        self._submit("Generative Remove", lambda _state: _State(document, layer_id, None))
 
-    def _restore(self, state: _State):
+    def _submit(self, label, update, *, background=False, keep_gesture=False):
+        if self._state is not None:
+            self._edits.append(_LocalEdit(label, update, background, keep_gesture))
+            self._drain_edits()
+
+    def _history_step(self, operation):
         self.canvas.cancel_gesture()
+        self._edits.append(operation)
+        self._drain_edits()
+
+    def _sync_undo_button(self):
+        self.undo_button.setEnabled(self.undo.canUndo() or self.edits_pending)
+
+    def _drain_edits(self):
+        if self._edit_task is not None or self._draining_edits:
+            return
+        self._draining_edits = True
+        try:
+            while self._edits:
+                edit = self._edits.popleft()
+                if not isinstance(edit, _LocalEdit):
+                    edit()
+                    continue
+                before = self._state
+                if edit.background:
+                    task = EditorTask(lambda _cancelled: edit.update(before))
+                    self._edit_task = task, edit, before
+                    task.signals.finished.connect(self._edit_finished, Qt.ConnectionType.QueuedConnection)
+                    QThreadPool.globalInstance().start(task)
+                    break
+                self._commit(edit, edit.update(before))
+        finally:
+            self._draining_edits = False
+            self._sync_undo_button()
+        if not self.edits_pending:
+            callbacks, self._after_edits = self._after_edits, deque()
+            for operation in callbacks:
+                if not self.after_edits(operation):
+                    operation()
+
+    def _edit_finished(self, task, state, error):
+        if self._edit_task is None or self._edit_task[0] is not task:
+            return
+        _, edit, before = self._edit_task
+        # Selecting another layer while this operation runs is independent of its result.
+        if state is not None and state.active_id == before.active_id:
+            state = replace(state, active_id=self._state.active_id)
+        if error:
+            self.set_message(error)
+        else:
+            self._commit(edit, state)
+        self._edit_task = None
+        self._drain_edits()
+
+    def _commit(self, edit, state):
+        if state is not None:
+            self.undo.push(_Edit(edit.label, self._state, state, self._restore, keep_gesture=edit.keep_gesture))
+
+    def _restore(self, state: _State, *, keep_gesture=False):
         previous = self._state
-        self._draft = None
+        keep_gesture = (
+            keep_gesture and previous is not None
+            and previous.active_id == state.active_id and previous.document.size == state.document.size
+        )
+        if not keep_gesture:
+            self.canvas.cancel_gesture()
         self._state = state
-        if previous is None or previous.document.size != state.document.size:
-            self._shown = None
-            self.canvas.set_size(state.document.size)
+        if keep_gesture and self._start is not None and self.tool.currentData() == "move":
+            draft = self._preview.draft
+            if draft is not None:
+                before = previous.document.layer(state.active_id)
+                layer = self.active_layer
+                if before is not None and layer is not None:
+                    self._preview.update_draft(
+                        layer.id, x=draft[1]["x"] + layer.x - before.x, y=draft[1]["y"] + layer.y - before.y,
+                    )
+        self._preview.set_document(state.document, reset=previous is None, keep_draft=keep_gesture)
         if previous is None or previous.selection is not state.selection:
-            self.canvas.set_selection(state.selection, state.selection.getbbox() if state.selection is not None else None)
+            self._show_selection(state.selection)
         if previous is None or previous.active_id != state.active_id:
             with QSignalBlocker(self.edit_mask):
                 self.edit_mask.setChecked(False)
         if previous is None or previous.document.layers is not state.document.layers:
-            self._list_layers()
+            self._sync_layers(previous.document.layers if previous is not None else ())
         else:
             self._sync_current_item()
         self._update_layer_controls()
-        self._queue_preview()
         self.changed.emit()
 
-    def _list_layers(self):
+    def _show_selection(self, selection):
+        if self._overlay_task is not None:
+            self._overlay_task[0].cancelled.set()
+            self._overlay_task = None
+        if selection is not None and selection.overlay is not None:
+            self._display_overlay(selection, selection.overlay)
+            return
+        self.canvas.set_selection_overlay(None, None)
+        if selection is not None:
+            task = EditorTask(lambda _cancelled: selection_overlay(selection.mask, selection.bounds))
+            self._overlay_task = task, selection
+            task.signals.finished.connect(self._overlay_finished, Qt.ConnectionType.QueuedConnection)
+            QThreadPool.globalInstance().start(task)
+
+    def _overlay_finished(self, task, overlay, error):
+        if self._overlay_task is None or self._overlay_task[0] is not task:
+            return
+        _, selection = self._overlay_task
+        self._overlay_task = None
+        if error:
+            self.set_message(error)
+        elif overlay is not None:
+            self._display_overlay(selection, overlay)
+
+    def _display_overlay(self, selection, overlay):
+        # Retain derived overlays for recent history without keeping old masks alive.
+        key = ref(selection)
+        if key in self._selection_cache:
+            self._selection_cache.move_to_end(key)
+        else:
+            for entry in tuple(self._selection_cache):
+                if entry() is None:
+                    self._selection_bytes -= self._selection_cache.pop(entry)
+            size = overlay.sizeInBytes()
+            while self._selection_cache and self._selection_bytes + size > _SELECTION_CACHE_BYTES:
+                oldest, size_removed = self._selection_cache.popitem(last=False)
+                self._selection_bytes -= size_removed
+                old_selection = oldest()
+                if old_selection is not None:
+                    old_selection.overlay = None
+            if size <= _SELECTION_CACHE_BYTES:
+                selection.overlay = overlay
+                self._selection_cache[key] = size
+                self._selection_bytes += size
+            else:
+                selection.overlay = None
+        self.canvas.set_selection_overlay(overlay, selection.bounds)
+
+    def _sync_layers(self, previous_layers):
+        previous = {layer.id: layer for layer in previous_layers}
+        current = {layer.id: layer for layer in self.document.layers}
         icons = {}
         with QSignalBlocker(self.layers):
-            self.layers.clear()
-            for layer in reversed(self.document.layers):
+            for layer_id in self._items.keys() - current.keys():
+                item = self._items.pop(layer_id)
+                self.layers.takeItem(self.layers.row(item))
+            for row, layer in enumerate(reversed(self.document.layers)):
+                old = previous.get(layer.id)
+                item = self._items.get(layer.id)
+                if item is None:
+                    item = QListWidgetItem()
+                    item.setData(Qt.ItemDataRole.UserRole, layer.id)
+                    self._items[layer.id] = item
+                    self.layers.insertItem(row, item)
+                elif self.layers.item(row) is not item:
+                    self.layers.takeItem(self.layers.row(item))
+                    self.layers.insertItem(row, item)
                 key = id(layer.image)
-                if key in self._thumbnails:
-                    icon = self._thumbnails[key]
-                else:
+                icon = icons.get(key) or self._thumbnails.get(key)
+                if icon is None:
                     thumbnail = asset_thumbnail(layer.image, self._thumbnail_size(layer.image.size))
                     icon = QIcon(pixmap(thumbnail))
                 icons[key] = icon
-                item = QListWidgetItem(icon, layer.name)
-                item.setData(Qt.ItemDataRole.UserRole, layer.id)
-                item.setCheckState(Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
-                kind = "Fill layer" if layer.coverage is not None else "Raster layer"
-                item.setToolTip(f"{kind} · {layer.image.width} × {layer.image.height} px · ({layer.x}, {layer.y})")
-                self.layers.addItem(item)
+                if old is None or old.image is not layer.image:
+                    item.setIcon(icon)
+                if old is None or old.name != layer.name:
+                    item.setText(layer.name)
+                if old is None or old.visible != layer.visible:
+                    item.setCheckState(Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
+                if old is None or (old.bounds, old.coverage is None) != (layer.bounds, layer.coverage is None):
+                    kind = "Fill layer" if layer.coverage is not None else "Raster layer"
+                    item.setToolTip(f"{kind} · {layer.image.width} × {layer.image.height} px · ({layer.x}, {layer.y})")
         self._thumbnails = icons
         self._sync_current_item()
 
@@ -425,16 +669,15 @@ class Editor(QWidget):
         return tuple(max(1, round(value * scale)) for value in size)
 
     def _sync_current_item(self):
-        with QSignalBlocker(self.layers):
-            for index in range(self.layers.count()):
-                if self.layers.item(index).data(Qt.ItemDataRole.UserRole) == self._state.active_id:
-                    self.layers.setCurrentRow(index)
-                    return
-            self.layers.setCurrentRow(-1)
+        item = self._items.get(self._state.active_id)
+        if self.layers.currentItem() is not item:
+            with QSignalBlocker(self.layers):
+                self.layers.setCurrentItem(item)
 
     def _choose_layer(self, item, _previous):
         if self._state:
             self.canvas.cancel_gesture()
+            self._preview.end_draft()
             layer_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
             self._state = replace(self._state, active_id=layer_id)
             self.edit_mask.setChecked(False)
@@ -445,9 +688,11 @@ class Editor(QWidget):
         editable = layer is not None and not layer.locked
         has_mask = layer is not None and layer.mask is not None
         row = self.layers.currentRow()
+        draft = self._preview.draft
         with QSignalBlocker(self.locked), QSignalBlocker(self.opacity), QSignalBlocker(self.edit_mask):
             self.locked.setChecked(layer.locked if layer is not None else False)
-            self.opacity.setValue(layer.opacity if layer is not None else 100)
+            if draft is None or "opacity" not in draft[1]:
+                self.opacity.setValue(layer.opacity if layer is not None else 100)
             if not has_mask:
                 self.edit_mask.setChecked(False)
         self.opacity_value.setText(f"{self.opacity.value()}%")
@@ -467,23 +712,39 @@ class Editor(QWidget):
     def _visibility(self, item):
         layer = self.document.layer(item.data(Qt.ItemDataRole.UserRole))
         visible = item.checkState() == Qt.CheckState.Checked
-        if visible != layer.visible:
-            self._replace_layer("Show layer" if visible else "Hide layer", replace(layer, visible=visible))
+        if layer is not None and (self.edits_pending or visible != layer.visible):
+            self._update_layer("Show layer" if visible else "Hide layer", layer_id=layer.id, visible=visible)
 
-    def _insert(self, layer: Layer, label: str):
-        document = self.document.insert(layer, above=self.active_layer)
-        self._commit(label, _State(document, layer.id, self.selection))
+    def _insert(self, label, make_layer, *, background=False):
+        above_id = self._state.active_id
+
+        def insert(state):
+            layer = make_layer(state)
+            document = state.document.insert(layer, above=state.document.layer(above_id))
+            return _State(document, layer.id, state.selection)
+
+        self._submit(label, insert, background=background)
 
     def _add_blank(self):
-        self._insert(Layer("Layer", Image.new("RGBA", self.document.size)), "Add layer")
+        self._insert("Add layer", lambda state: Layer("Layer", Image.new("RGBA", state.document.size)), background=True)
 
-    def _replace_layer(self, label, layer: Layer):
-        self._commit(label, replace(self._state, document=self.document.update(layer)))
+    def _edit_layer(self, label, layer_id, update, *, background=False, keep_gesture=False):
+        def apply(state):
+            layer = state.document.layer(layer_id)
+            if layer is None:
+                return None
+            updated = update(state, layer)
+            if updated is not layer:
+                return replace(state, document=state.document.update(updated))
+            return None
 
-    def _update_layer(self, label, **changes):
-        layer = self.active_layer
-        if layer is not None and any(getattr(layer, key) != value for key, value in changes.items()):
-            self._replace_layer(label, replace(layer, **changes))
+        self._submit(label, apply, background=background, keep_gesture=keep_gesture)
+
+    def _update_layer(self, label, *, layer_id=None, **changes):
+        def update(_state, layer):
+            return replace(layer, **changes) if any(getattr(layer, key) != value for key, value in changes.items()) else layer
+
+        self._edit_layer(label, self._state.active_id if layer_id is None else layer_id, update)
 
     def _rename(self):
         if self.active_layer is None:
@@ -495,57 +756,88 @@ class Editor(QWidget):
     def _duplicate(self):
         layer = self.active_layer
         if layer is not None:
-            self._insert(replace(layer, name=f"{layer.name} copy", id=uuid4().hex, locked=False), "Duplicate layer")
+            def duplicate(state):
+                original = state.document.layer(layer.id)
+                if original is None:
+                    return None
+                copied = replace(original, name=f"{original.name} copy", id=uuid4().hex, locked=False)
+                return _State(state.document.insert(copied, above=original), copied.id, state.selection)
+
+            self._submit("Duplicate layer", duplicate)
 
     def _delete(self):
-        layer = self.active_layer
-        if layer is None or layer.locked:
-            return
-        index = self.document.layers.index(layer)
-        layers = self.document.layers[:index] + self.document.layers[index + 1:]
-        active_id = layers[max(0, index - 1)].id if layers else None
-        self._commit("Delete layer", _State(replace(self.document, layers=layers), active_id, self.selection))
+        layer_id = self._state.active_id
+
+        def delete(state):
+            layer = state.document.layer(layer_id)
+            if layer is None or layer.locked:
+                return None
+            index = state.document.layers.index(layer)
+            layers = state.document.layers[:index] + state.document.layers[index + 1:]
+            active_id = state.active_id
+            if active_id == layer_id:
+                active_id = layers[max(0, index - 1)].id if layers else None
+            return _State(replace(state.document, layers=layers), active_id, state.selection)
+
+        self._submit("Delete layer", delete)
 
     def _reorder(self, direction):
-        layers = list(self.document.layers)
-        layer = self.active_layer
-        if layer is None:
-            return
-        index = layers.index(layer)
-        destination = index + direction
-        if 0 <= destination < len(layers):
-            layers.insert(destination, layers.pop(index))
-            self._commit("Reorder layer", replace(self._state, document=replace(self.document, layers=tuple(layers))))
+        layer_id = self._state.active_id
+
+        def reorder(state):
+            layer = state.document.layer(layer_id)
+            if layer is None:
+                return None
+            layers = list(state.document.layers)
+            index = layers.index(layer)
+            destination = index + direction
+            if 0 <= destination < len(layers):
+                layers.insert(destination, layers.pop(index))
+                return replace(state, document=replace(state.document, layers=tuple(layers)))
+            return None
+
+        self._submit("Reorder layer", reorder)
 
     def _opacity_changed(self, value):
         self.opacity_value.setText(f"{value}%")
         if self.opacity.isSliderDown() and self.active_layer is not None:
-            self._draft = self.document.update(replace(self.active_layer, opacity=value))
-            self._queue_preview()
+            self._preview.update_draft(self.active_layer.id, opacity=value)
         else:
             self._commit_opacity()
 
     def _commit_opacity(self):
-        self._draft = None
-        self._update_layer("Layer opacity", opacity=self.opacity.value())
-        self._queue_preview()
+        layer, opacity = self.active_layer, self.opacity.value()
+        changed = layer is not None and opacity != layer.opacity
+        self._preview.end_draft(commit=changed)
+        if layer is not None and (changed or self.edits_pending):
+            self._update_layer("Layer opacity", opacity=opacity)
 
     def _select_pixels(self, path):
-        selection = combine_selection(self.selection, path, self.document.size, self.selection_mode.currentData())
-        if selection is not self.selection:
-            if selection is not None and selection.getbbox() is None:
-                selection = None
-            self._commit("Select pixels", replace(self._state, selection=selection))
+        mode = self.selection_mode.currentData()
+
+        def select(state):
+            previous = state.selection.mask if state.selection is not None else None
+            mask = combine_selection(previous, path, state.document.size, mode)
+            if mask is not previous:
+                selection = _Selection.prepare(mask)
+                if selection is not None or previous is not None:
+                    return replace(state, selection=selection)
+            return None
+
+        self._submit("Select pixels", select, background=True, keep_gesture=True)
 
     def _clear_selection(self):
-        if self.selection is not None:
-            self._commit("Clear selection", replace(self._state, selection=None))
+        self._submit("Clear selection", lambda state: replace(state, selection=None) if state.selection else None)
 
     def _crop(self):
-        if self.selection is not None:
-            area = Rect(*self.selection.getbbox())
-            if area != self.document.bounds:
-                self._commit("Crop canvas", replace(self._state, document=self.document.crop(area), selection=None))
+        def crop(state):
+            if state.selection is not None:
+                area = Rect(*state.selection.bounds)
+                if area != state.document.bounds:
+                    return replace(state, document=state.document.crop(area), selection=None)
+            return None
+
+        self._submit("Crop canvas", crop)
 
     def _tools_changed(self, *_):
         tool = self.tool.currentData()
@@ -555,31 +847,53 @@ class Editor(QWidget):
         editing_mask = self.edit_mask.isChecked()
         painting = tool in ("brush", "eraser")
         can_paint = editable and (layer.mask is not None if editing_mask else layer.coverage is None)
-        self.canvas.set_drawing_enabled(
-            not self._busy and (tool in SELECTION_TOOLS or (editable and tool == "move") or (painting and can_paint)),
-        )
+        can_draw = tool in SELECTION_TOOLS or (editable and tool == "move") or (painting and can_paint)
+        self.canvas.set_drawing_enabled(not self._busy and can_draw)
+        hint = ""
+        if self.document is not None and not self._busy and not can_draw and (painting or tool == "move"):
+            if layer is None:
+                action = "Select a layer in Layers" if self.document.layers else "Add a layer"
+                hint = f"{action} to use {self.tool.currentText()}."
+            elif not layer.visible:
+                hint = f"Turn on visibility for “{layer.name}” in Layers."
+            elif layer.locked:
+                hint = f"Turn off Lock layer to edit “{layer.name}”."
+            elif layer.mask is not None:
+                hint = "Turn on Paint mask or select a raster layer to paint pixels."
+            else:
+                hint = "Add a layer mask or select a raster layer to paint pixels."
+        self.tool_hint.setText(hint)
+        self.tool_hint.setVisible(bool(hint))
         self.selection_mode.setVisible(tool in SELECTION_TOOLS)
         self.clear_button.setEnabled(self.selection is not None)
-        self.crop_button.setEnabled(self.selection is not None and self.selection.getbbox() != box(self.document.bounds))
+        selection = self._state.selection if self._state is not None else None
+        self.crop_button.setEnabled(selection is not None and selection.bounds != box(self.document.bounds))
         self.brush_controls.setVisible(painting)
         self.color.setEnabled(tool == "brush" and not editing_mask)
         self._brush_preview()
 
     def _pointer_start(self, point):
         self._start = point
-        self._points = [(math.floor(point.x()), math.floor(point.y()))]
+        if self.tool.currentData() == "move":
+            self._preview.begin_draft()
+        else:
+            self._points = [(math.floor(point.x()), math.floor(point.y()))]
 
-    def _move_layer(self, point):
-        delta = point - self._start
+    def _layer_position(self, point):
+        dx, dy = self._drag_offset(point)
         layer = self.active_layer
-        return replace(layer, x=layer.x + round(delta.x()), y=layer.y + round(delta.y()))
+        return layer.x + dx, layer.y + dy
+
+    def _drag_offset(self, point):
+        delta = point - self._start
+        return round(delta.x()), round(delta.y())
 
     def _pointer_move(self, point):
         if self._start is None:
             return
         if self.tool.currentData() == "move":
-            self._draft = self.document.update(self._move_layer(point))
-            self._queue_preview()
+            x, y = self._layer_position(point)
+            self._preview.update_draft(self.active_layer.id, x=x, y=y)
         else:
             self._points.append((math.floor(point.x()), math.floor(point.y())))
 
@@ -589,24 +903,37 @@ class Editor(QWidget):
         layer = self.active_layer
         tool = self.tool.currentData()
         if tool == "move":
-            moved = self._move_layer(point)
-            self._update_layer("Move layer", x=moved.x, y=moved.y)
+            dx, dy = self._drag_offset(point)
+            self._start = None
+            moved = bool(dx or dy)
+            self._preview.end_draft(commit=moved)
+            if moved:
+                self._edit_layer(
+                    "Move layer", layer.id, lambda _state, target: replace(target, x=target.x + dx, y=target.y + dy),
+                    keep_gesture=True,
+                )
         else:
-            self._points.append((math.floor(point.x()), math.floor(point.y())))
+            points, self._points = self._points, []
+            points.append((math.floor(point.x()), math.floor(point.y())))
+            self._start = None
             color = self._ink.getRgb()[:3] if tool == "brush" else None
-            painted = paint(
-                self.document, layer, self._points, size=self.brush_size.value(), strength=self.strength.value(),
-                color=color, edit_mask=self.edit_mask.isChecked(), selection=self.selection,
-            )
-            if painted is not layer:
-                label = "Paint mask" if self.edit_mask.isChecked() else ("Brush stroke" if color else "Erase stroke")
-                self._replace_layer(label, painted)
-        self._reset_gesture()
+            size, strength, edit_mask = self.brush_size.value(), self.strength.value(), self.edit_mask.isChecked()
+            label = "Paint mask" if edit_mask else ("Brush stroke" if color is not None else "Erase stroke")
+
+            def stroke(state, target):
+                if target.locked or not target.visible or (target.mask is None if edit_mask else target.coverage is not None):
+                    return target
+                return paint(
+                    state.document, target, points, size=size, strength=strength, color=color, edit_mask=edit_mask,
+                    selection=state.selection.mask if state.selection is not None else None,
+                )
+
+            self._edit_layer(label, layer.id, stroke, background=True, keep_gesture=True)
 
     def _reset_gesture(self):
-        self._draft = self._start = None
+        self._start = None
         self._points.clear()
-        self._queue_preview()
+        self._preview.end_draft()
 
     def _brush_preview(self):
         color = QColor(self._ink)
@@ -624,29 +951,43 @@ class Editor(QWidget):
             self._brush_preview()
 
     def _add_mask(self):
-        layer = self.active_layer
-        mask = Image.new("L", layer.image.size, 255) if self.selection is None else self.selection.crop(box(layer.bounds))
-        self._update_layer("Add layer mask", mask=mask)
+        def add_mask(state, layer):
+            if layer.locked or layer.mask is not None:
+                return layer
+            selection = state.selection
+            mask = selection.mask.crop(box(layer.bounds)) if selection else Image.new("L", layer.image.size, 255)
+            return replace(layer, mask=mask)
+
+        self._edit_layer("Add layer mask", self._state.active_id, add_mask, background=True)
 
     def _edit_mask_selection(self, value):
-        layer = self.active_layer
-        overlap = self.document.bounds.intersect(layer.bounds)
-        if overlap is None:
-            return
-        coverage = self.selection.crop(box(overlap))
-        if coverage.getbbox() is not None:
+        def edit_mask(state, layer):
+            overlap = state.document.bounds.intersect(layer.bounds)
+            if overlap is None or state.selection is None or layer.mask is None or layer.locked:
+                return layer
+            coverage = state.selection.mask.crop(box(overlap))
+            if coverage.getbbox() is None:
+                return layer
             mask = paint_mask(layer.mask, overlap.relative_to(layer.bounds), coverage, value)
-            self._update_layer("Edit layer mask", mask=mask)
+            return replace(layer, mask=mask) if mask is not layer.mask else layer
+
+        self._edit_layer("Edit layer mask", self._state.active_id, edit_mask, background=True)
 
     def _transform(self, label, operation):
-        layer = self.active_layer.transform(lambda image: image.transpose(operation))
-        self._replace_layer(label, layer)
+        self._edit_layer(
+            label, self._state.active_id,
+            lambda _state, layer: layer.transform(lambda image: image.transpose(operation)) if not layer.locked else layer,
+            background=True,
+        )
 
     def _resize_layer(self):
         layer = self.active_layer
         size = dimensions(self, "Resize layer", layer.image.size, preserve_aspect=True)
         if size is not None and size != layer.image.size:
-            self._replace_layer("Resize layer", layer.resize(size))
+            self._edit_layer(
+                "Resize layer", layer.id, lambda _state, target: target.resize(size) if not target.locked else target,
+                background=True,
+            )
 
     def _adjustments(self):
         layer = self.active_layer
@@ -663,8 +1004,7 @@ class Editor(QWidget):
 
         def preview():
             values = tuple(field.value() for field in fields)
-            self._draft = self.document.update(replace(layer, adjustments=values))
-            self._queue_preview()
+            self._preview.update_draft(layer.id, adjustments=values)
 
         for field in fields:
             field.valueChanged.connect(preview)
@@ -673,53 +1013,18 @@ class Editor(QWidget):
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
         accepted = dialog.exec()
-        self._draft = None
-        if accepted:
-            self._update_layer("Color adjustments", adjustments=tuple(field.value() for field in fields))
-        self._queue_preview()
-
-    def _preview_request(self):
-        document = self._draft or self.document
-        if document is None or not self.isVisible():
-            return None
-        visible = self.canvas.mapToScene(self.canvas.viewport().rect()).boundingRect()
-        scale = self.canvas.transform().m11()
-        margin = 48 / scale
-        area = Rect(
-            math.floor(visible.left() - margin), math.floor(visible.top() - margin),
-            math.ceil(visible.right() + margin), math.ceil(visible.bottom() + margin),
-        ).intersect(document.bounds)
-        if area is None:
-            return None
-        scale = min(1, scale * self.canvas.devicePixelRatioF())
-        size = max(1, round(area.width * scale)), max(1, round(area.height * scale))
-        return document, area, size
-
-    def _queue_preview(self):
-        if not self._preview_running and not self._timer.isActive():
-            self._timer.start()
-
-    def _render_preview(self):
-        request = self._preview_request()
-        if request is None or request == self._shown:
-            return
-        self._preview_running = True
-        worker = _Preview(request)
-        worker.signals.finished.connect(self._preview_finished)
-        QThreadPool.globalInstance().start(worker)
-
-    def _preview_finished(self, request, image, error):
-        self._preview_running = False
-        if request != self._preview_request():
-            self._queue_preview()
-            return
-        self._shown = request
-        if error:
-            self.set_message(error)
-        else:
-            _, area, _ = request
-            self.canvas.set_image(QPixmap.fromImage(image), rect=QRectF(area.left, area.top, area.width, area.height))
+        values = tuple(field.value() for field in fields)
+        changed = bool(accepted and values != layer.adjustments)
+        self._preview.end_draft(commit=changed)
+        if changed:
+            self._update_layer("Color adjustments", layer_id=layer.id, adjustments=values)
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._queue_preview()
+        self._preview.resume()
+
+    def hideEvent(self, event):
+        self.canvas.cancel_gesture()
+        self._preview.end_draft()
+        self._preview.suspend()
+        super().hideEvent(event)

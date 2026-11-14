@@ -65,8 +65,10 @@ def test_variant_preview_replaces_alpha_and_invalidates_on_edit(make_editor):
     editor.add_variant(FillPreview(hole, bounds[:2], "Review the edge."))
     editor.add_variant(FillPreview(base.crop(bounds), bounds[:2]))
     assert editor.selected_variant == 1
+    assert editor._status.text() == "Variation ready. Use Before and After to compare."
 
     editor._chooser.setCurrentIndex(0)
+    assert editor._status.text() == "Review the edge."
     canvas = editor._canvas
     center = canvas.mapFromScene(QPointF(40, 30))
     pixels = canvas.viewport().grab().toImage()

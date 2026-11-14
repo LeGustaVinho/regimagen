@@ -4,6 +4,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 from PySide6.QtCore import QPointF, QSettings, Qt
 from PySide6.QtTest import QTest
@@ -53,7 +54,7 @@ def test_desktop_applies_then_reopens_and_reduces_fill_without_generation(tmp_pa
         def __exit__(self, *_args):
             pass
 
-        def generate(self, prompt, references, *, verify_references):
+        def generate(self, prompt, references, *, verify_references, output_schema=None):
             calls.append(prompt)
             assert verify_references
             assert len(references) == 3
@@ -99,6 +100,7 @@ def test_desktop_applies_then_reopens_and_reduces_fill_without_generation(tmp_pa
 
         editor._apply.click()
         wait_for_task(window)
+        assert "Saved image version" in window.task_status.text() and "Recent" in window.task_status.text()
         first = window.source
         first_fill = store.get_fill(first)
         assert first_fill.base.id == base.id
@@ -162,20 +164,24 @@ def test_desktop_applies_then_reopens_and_reduces_fill_without_generation(tmp_pa
         window.close()
 
 
-def test_desktop_reopens_and_reduces_legacy_fill_without_reference_metadata(tmp_path, monkeypatch, qt_app):
+@pytest.mark.parametrize("transparent_background", [False, True])
+def test_desktop_reopens_and_reduces_saved_fill(tmp_path, monkeypatch, qt_app, transparent_background):
     store = Store(tmp_path / "workspace")
     image = Image.new("RGB", (192, 160), (32, 52, 61))
     base = store.import_source(image, "original.png")
     bounds = (38, 32, 155, 129)
     mask = Image.new("L", image.size)
     mask.paste(255, bounds)
-    filled = image.copy()
-    copper = (197, 113, 43)
-    filled.paste(copper, bounds)
+    filled = image.convert("RGBA") if transparent_background else image.copy()
+    fill_color = (0, 0, 0, 0) if transparent_background else (197, 113, 43)
+    filled.paste(fill_color, bounds)
+    metadata = {"crop": [0, 0, 160, 160], "shift": [0, 0], "color": [0, 0, 0], "feather": 1}
+    if transparent_background:
+        metadata["transparency"] = "background"
     saved = store.save_fill(
-        base, filled, mask, Image.new("RGB", (160, 160), copper),
-        prompt="Replace the middle with copper", edit_alpha=False,
-        metadata={"crop": [0, 0, 160, 160], "shift": [0, 0], "color": [0, 0, 0], "feather": 1},
+        base, filled, mask, Image.new(filled.mode, (160, 160), fill_color),
+        prompt="Fundo transparente" if transparent_background else "Replace the middle with copper",
+        edit_alpha=False, metadata=metadata,
         base_sha256=sha256(base.path.read_bytes()).hexdigest(),
     )
     generation_calls = []
@@ -206,8 +212,8 @@ def test_desktop_reopens_and_reduces_legacy_fill_without_reference_metadata(tmp_
         assert not generation_calls
         assert store.get_fill(window.source).derived_from == saved.id
         output = load_source(window.source.path)
-        assert output.getpixel((70, 70)) == copper
-        assert output.getpixel((130, 70)) == image.getpixel((130, 70))
+        assert output.getpixel((70, 70)) == fill_color
+        assert output.getpixel((130, 70)) == image.convert(filled.mode).getpixel((130, 70))
     finally:
         if window.task is not None:
             window.task.cancelled.set()

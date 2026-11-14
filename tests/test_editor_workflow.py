@@ -1,19 +1,23 @@
+import io
 import time
 from pathlib import Path
+from threading import Event
 
 import pytest
 from PIL import Image
 from PySide6.QtCore import QPointF, QSettings, QTimer, Qt
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QSpinBox
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QSpinBox
 
 import regimagen.app as desktop
 import regimagen.editor as editor_module
-from regimagen.codex import Cancelled
+import regimagen.jobs as jobs
+from regimagen.codex import AuthRequired, Cancelled, GeneratedImage, QuotaPaused
 from regimagen.document import render
 from regimagen.fill import FillCandidate
-from regimagen.geometry import FRAME, Grid
+from regimagen.geometry import FRAME, Cell, Grid
+from regimagen.periodic import wrap_offset
 from regimagen.project import load_project
 from regimagen.storage import Store
 
@@ -27,15 +31,18 @@ def wait_for(predicate, timeout=12):
 
 
 def idle(window):
-    wait_for(lambda: window.task is None)
+    wait_for(lambda: window.task is None and not window.editor.edits_pending)
 
 
-def gesture(view, *points):
+def gesture(view, *points, wait=True):
     positions = [view.mapFromScene(QPointF(*point)) for point in points]
     QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=positions[0])
     for position in positions[1:]:
         QTest.mouseMove(view.viewport(), position)
     QTest.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=positions[-1])
+    editor = view.parentWidget()
+    if wait and isinstance(editor, editor_module.Editor):
+        wait_for(lambda: not editor.edits_pending)
 
 
 def choose_tool(editor, name):
@@ -59,6 +66,160 @@ def window(tmp_path, monkeypatch, qt_app):
     monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Discard)
     window.close()
     qt_app.processEvents()
+
+
+def test_pattern_preview_repeats_edits_and_offset_is_undoable(window, monkeypatch):
+    base = Image.new("RGBA", (61, 41), "black")
+    image = Image.new("RGBA", (27, 19), (140, 20, 20, 220))
+    image.putpixel((1, 5), (26, 100, 20, 80))
+    mask = Image.new("L", image.size, 217)
+    mask.putpixel((1, 5), 40)
+    layer = desktop.Layer("Top", image, 8, 9, mask=mask, coverage=mask.copy())
+    document = desktop.Document.from_image(base, "Pattern").insert(layer)
+    window._show_document(document)
+    editor = window.editor
+    window.pattern_preview_action.trigger()
+    canvas = editor.canvas
+    assert canvas.pattern_preview and canvas.sceneRect().width() >= 3 * base.width
+    assert editor.document is document and not editor.dirty
+    assert window.offset_action.isEnabled()
+
+    def open_offset(accept, dx, dy):
+        def exec_dialog(dialog):
+            dialog.show()
+            fields = dialog.findChildren(QSpinBox)
+            assert [field.value() for field in fields] == [13, 9]
+            for field, value in zip(fields, (dx, dy)):
+                field.setValue(value)
+            button = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Apply)
+            wait_for(button.isEnabled)
+            assert editor.document is document
+            assert editor._preview.document is not document
+            dialog.hide()
+            return accept
+
+        monkeypatch.setattr(QDialog, "exec", exec_dialog)
+        window.offset_action.trigger()
+
+    open_offset(False, 8, 7)
+    assert editor.document is document and editor._preview.document is document
+    open_offset(True, -5, 31)
+    shifted = editor.active_layer
+    for key in ("image", "mask", "coverage"):
+        assert getattr(shifted, key).tobytes() == wrap_offset(getattr(layer, key), -5, 31).tobytes()
+    assert (shifted.x, shifted.y) == (layer.x, layer.y)
+    assert editor.document.layers[0] is document.layers[0] and editor.undo.count() == 1
+    editor.undo.undo()
+    assert editor.document is document
+    editor.undo.redo()
+    assert editor.active_layer is shifted
+    editor.layers.setCurrentRow(1)
+    choose_tool(editor, "brush")
+    selection = editor.document
+    gesture(canvas, (-12, 20), (-5, 21), (1, 22))
+    assert editor.document is selection
+    gesture(canvas, (42, 17), (48, 18))
+    assert editor.document is not selection
+
+    def settled():
+        return editor._preview.shown == editor._preview._exact_target()
+
+    wait_for(settled)
+    frame = editor._preview._displayed
+    left = round((42 - frame.area.left) * frame.pixmap.width() / frame.area.width)
+    right = round((42 + base.width - frame.area.left) * frame.pixmap.width() / frame.area.width)
+    y = round((17 - frame.area.top) * frame.pixmap.height() / frame.area.height)
+    preview = frame.pixmap.toImage()
+    assert preview.pixelColor(left, y) == preview.pixelColor(right, y)
+    assert preview.pixelColor(left, y).green() > 100
+    previous_zoom = canvas.transform().m11()
+    canvas.zoom(1.5)
+    assert canvas.transform().m11() > previous_zoom
+    canvas.camera(canvas.transform().m11(), QPointF(2 * base.width, base.height / 2))
+    canvas.moved.emit()
+    wait_for(settled)
+    assert canvas.center().x() > base.width
+    window._show_document(document)
+    assert not canvas.pattern_preview and not window.pattern_preview_action.isChecked()
+
+
+def test_pattern_review_cancel_retry_apply_and_export(window, tmp_path, monkeypatch):
+    base = Image.new("RGBA", (61, 41), (13, 54, 90, 190))
+    base.putpixel((4, 15), (33, 74, 100, 243))
+    document = desktop.Document.from_image(base, "Pattern")
+    window._show_document(document)
+    calls = []
+    started = Event()
+    mask = Image.new("L", base.size)
+    mask.paste(255, (28, 0, 32, base.height))
+    mask.putpixel((29, 8), 127)
+
+    def detect(original, shifted, offset, _executable, *, cancelled):
+        assert offset == (30, 20) and not cancelled.is_set()
+        assert wrap_offset(original, *offset).tobytes() == shifted.tobytes()
+        return mask
+
+    def repair(shifted, approved, _executable, *, cancelled, progress):
+        assert approved is mask
+        calls.append(True)
+        if len(calls) == 2:
+            started.set()
+            assert cancelled.wait(6)
+            raise Cancelled("Pattern repair canceled.")
+        edited = shifted.copy()
+        edited.paste((27, 28, 29, 155), mask=approved)
+        progress(1, 1)
+        return edited, ()
+
+    monkeypatch.setattr(desktop, "detect_pattern_seams", detect)
+    monkeypatch.setattr(desktop, "repair_pattern", repair)
+    monkeypatch.setattr(window, "_codex_resolver", lambda: lambda: Path("codex"))
+    window.fix_seams_action.trigger()
+    idle(window)
+    session = window.pattern
+    assert session is not None, window.task_status.text()
+    page = session.editor
+    assert not page.generate.isEnabled()
+    page.detect.click()
+    idle(window)
+    assert page.mask is mask and page.generate.isEnabled()
+    page.generate.click()
+    idle(window)
+    assert page.apply.isEnabled() and page.canvas.pattern_preview
+    page.detect.click()
+    idle(window)
+    assert page.mask is mask and not page.canvas.pattern_preview and page.before.isChecked()
+    assert len(session.variants) == 1
+    page.before.click()
+    page.after.click()
+    page.generate.click()
+    wait_for(started.is_set)
+    page.cancel.click()
+    idle(window)
+    assert page.mask is mask and len(session.variants) == 1 and page.apply.isEnabled()
+    page.generate.click()
+    idle(window)
+    assert len(session.variants) == 2
+    page.apply.click()
+    assert window.pattern is None and window.editor.undo.count() == 1
+    corrected = render(window.editor.document)
+    approved = wrap_offset(mask, -30, -20)
+    expected = base.copy()
+    expected.paste((27, 28, 29, 155), mask=approved)
+    assert corrected.tobytes() == expected.tobytes()
+    window.editor.undo.undo()
+    assert window.editor.document is document
+    window.editor.undo.redo()
+    project, exported = tmp_path / "pattern.regimagen", tmp_path / "pattern.png"
+    monkeypatch.setattr(window, "_save_destination", lambda *_: project)
+    window.save_as_action.trigger()
+    idle(window)
+    assert render(load_project(project)).tobytes() == corrected.tobytes()
+    monkeypatch.setattr(window, "_save_destination", lambda *_: exported)
+    window.export_action.trigger()
+    idle(window)
+    with Image.open(exported) as png:
+        assert png.size == base.size and png.tobytes() == corrected.tobytes()
 
 
 def test_open_edit_save_and_reopen_without_codex(window, tmp_path, monkeypatch):
@@ -105,7 +266,7 @@ def test_open_edit_save_and_reopen_without_codex(window, tmp_path, monkeypatch):
     assert len(editor.document.layers) == 2
 
     expected = render(editor.document)
-    wait_for(lambda: editor._shown is not None and editor._shown[0] is editor.document)
+    wait_for(lambda: editor._preview.shown is not None and editor._preview.shown[0] is editor.document)
     display = editor.canvas._image.pixmap().toImage()
     assert display.pixelColor(24, 22).getRgb() == expected.getpixel((24, 22))
     export = tmp_path / "result.png"
@@ -146,6 +307,7 @@ def test_canvas_selection_masks_brush_and_transforms(window, monkeypatch):
     editor = window.editor
     assert editor.document.layers == () and render(editor.document).getbbox() is None
     action(editor, "Transparent layer").trigger()
+    idle(window)
     choose_tool(editor, "brush")
     editor.brush_size.setValue(12)
     before = editor.undo.count()
@@ -175,6 +337,7 @@ def test_canvas_selection_masks_brush_and_transforms(window, monkeypatch):
     assert editor.selection.getpixel((20, 24)) == 0 and editor.selection.getpixel((60, 40)) == 255
 
     action(editor, "Add layer mask").trigger()
+    idle(window)
     assert render(editor.document).getpixel((20, 24))[3] == 0
     editor.clear_button.click()
     editor.edit_mask.setChecked(True)
@@ -182,10 +345,12 @@ def test_canvas_selection_masks_brush_and_transforms(window, monkeypatch):
     gesture(editor.canvas, (20, 24))
     assert render(editor.document).getpixel((20, 24))[3] == 255
     action(editor, "Rotate 90° clockwise").trigger()
+    idle(window)
     assert editor.active_layer.image.size == editor.active_layer.mask.size == (80, 100)
     action(editor, "Flip horizontally").trigger()
     monkeypatch.setattr(editor_module, "dimensions", lambda *_, preserve_aspect: (40, 50) if preserve_aspect else None)
     action(editor, "Resize…").trigger()
+    idle(window)
     assert editor.active_layer.image.size == editor.active_layer.mask.size == (40, 50)
 
     choose_tool(editor, "rectangle")
@@ -206,7 +371,7 @@ def test_undo_crop_repaints_when_previous_preview_is_still_cached(window):
     original = desktop.Document.from_image(Image.new("RGB", (300, 180), "red"), "Crop")
     window._show_document(original)
     choose_tool(editor, "rectangle")
-    wait_for(lambda: editor._shown is not None and editor._shown[0] is original)
+    wait_for(lambda: editor._preview.shown is not None and editor._preview.shown[0] is original)
     gesture(editor.canvas, (40, 30), (160, 120))
     editor.crop_button.click()
     assert editor.document.size != original.size
@@ -224,7 +389,7 @@ def test_undo_and_redo_cancel_a_stroke_before_switching_layers(window):
     with_overlay = editor.document
     choose_tool(editor, "brush")
     editor.brush_size.setValue(12)
-    wait_for(lambda: editor._shown is not None and editor._shown[0] is with_overlay)
+    wait_for(lambda: editor._preview.shown is not None and editor._preview.shown[0] is with_overlay)
 
     canvas = editor.canvas
     point = canvas.mapFromScene(QPointF(20, 20))
@@ -240,6 +405,121 @@ def test_undo_and_redo_cancel_a_stroke_before_switching_layers(window):
         assert render(editor.document).getpixel((20, 20)) == (255, 0, 0, 255)
 
 
+def test_completed_strokes_are_ordered_before_undo_and_save(window, tmp_path, monkeypatch):
+    editor = window.editor
+    original = desktop.Document.from_image(Image.new("RGBA", (150, 100)), "Brush")
+    window._show_document(original)
+    choose_tool(editor, "brush")
+    editor.brush_size.setValue(10)
+    started, release = Event(), Event()
+    original_paint = editor_module.paint
+    calls = []
+
+    def paint(document, layer, points, **options):
+        calls.append(document)
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(5)
+        return original_paint(document, layer, points, **options)
+
+    destination = tmp_path / "strokes.regimagen"
+    exported = tmp_path / "strokes.png"
+    monkeypatch.setattr(editor_module, "paint", paint)
+    monkeypatch.setattr(window, "_save_destination", lambda title, *_: destination if title == "Save project" else exported)
+    try:
+        gesture(editor.canvas, (20, 20), (30, 20), wait=False)
+        wait_for(started.is_set)
+        editor.canvas.zoom(1.2)
+        gesture(editor.canvas, (55, 40), (65, 40), wait=False)
+        editor.undo_button.click()
+        window.save_as_action.trigger()
+        window.export_action.trigger()
+        assert editor.document is original and editor.edits_pending
+        assert not destination.exists() and not exported.exists()
+    finally:
+        release.set()
+    idle(window)
+    assert len(calls) == 2 and calls[0] is original and calls[1] is editor.document
+    assert editor.undo.canRedo() and not editor.dirty
+    saved = render(load_project(destination))
+    assert saved.getpixel((24, 20))[3] == 255 and saved.getpixel((60, 40))[3] == 0
+    with Image.open(exported) as output:
+        assert output.tobytes() == saved.tobytes()
+    editor.redo_button.click()
+    assert render(editor.document).getpixel((60, 40))[3] == 255
+
+
+def test_layered_fill_recovers_when_background_apply_fails(window, monkeypatch):
+    from regimagen.document_fill import layered_variant
+    from regimagen.fill import FillPreview
+
+    editor = window.editor
+    original = desktop.Document.from_image(Image.new("RGBA", (70, 70), "red"), "Fill")
+    window._show_document(original)
+    editor.fill_button.click()
+    idle(window)
+    session = window.layer_fill
+    selection = Image.new("L", original.size)
+    selection.paste(255, (10, 10, 20, 20))
+    session.editor._mask = selection
+    preview = FillPreview(Image.new("RGBA", (10, 10), "green"), (10, 10))
+    variant = layered_variant(original, selection, preview, None)
+    window._append_layer_variant(variant)
+    started, release = Event(), Event()
+
+    def fail(_mask):
+        started.set()
+        assert release.wait(5)
+        raise RuntimeError("Could not prepare the selection.")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(editor_module._Selection, "prepare", staticmethod(fail))
+        try:
+            session.editor._apply.click()
+            wait_for(started.is_set)
+            assert not session.editor._apply.isEnabled()
+            window._apply_layer_fill()
+            window._close_layer_fill()
+            assert window.layer_fill is session
+        finally:
+            release.set()
+        idle(window)
+    assert window.layer_fill is session and session.editor._apply.isEnabled()
+    assert editor.document is original and not editor.undo.canUndo()
+    session.editor._apply.click()
+    idle(window)
+    assert window.layer_fill is None and editor.document is variant.document and editor.undo.count() == 1
+
+
+def test_queued_drags_accumulate_layer_displacement(window, monkeypatch):
+    editor = window.editor
+    original = desktop.Document.from_image(Image.new("RGBA", (120, 90)), "Layer")
+    window._show_document(original)
+    choose_tool(editor, "brush")
+    started, release = Event(), Event()
+    real_paint = editor_module.paint
+
+    def paint(*args, **kwargs):
+        started.set()
+        assert release.wait(5)
+        return real_paint(*args, **kwargs)
+
+    monkeypatch.setattr(editor_module, "paint", paint)
+    try:
+        gesture(editor.canvas, (24, 26), (28, 32), wait=False)
+        wait_for(started.is_set)
+        choose_tool(editor, "move")
+        gesture(editor.canvas, (20, 20), (30, 20), wait=False)
+        gesture(editor.canvas, (30, 20), (40, 20), wait=False)
+        assert editor.document is original
+    finally:
+        release.set()
+    idle(window)
+    assert editor.active_layer.x == 20 and editor.undo.count() == 3
+    editor.undo.undo()
+    assert editor.active_layer.x == 10
+
+
 def test_color_adjustments_preview_cancel_and_undo(window):
     editor = window.editor
     original = desktop.Document.from_image(Image.new("RGBA", (40, 30), (100, 45, 20, 200)), "Paint")
@@ -250,19 +530,22 @@ def test_color_adjustments_preview_cancel_and_undo(window):
         dialog = QApplication.activeModalWidget()
         assert isinstance(dialog, QDialog)
         brightness, contrast, saturation = dialog.findChildren(QSpinBox)
+        before = editor._preview._displayed
         brightness.setValue(20)
         contrast.setValue(10)
         saturation.setValue(-30)
-        previews.append(render(editor._draft).getpixel((12, 12)))
+        wait_for(lambda: editor._preview._displayed is not None and editor._preview._displayed is not before)
+        previews.append(editor.canvas._image.pixmap().toImage().pixelColor(12, 12).getRgb())
         dialog.accept() if accept else dialog.reject()
 
     QTimer.singleShot(0, lambda: adjust(False))
     action(editor, "Color adjustments…").trigger()
-    assert editor.document is original and editor._draft is None and not editor.undo.canUndo()
+    assert editor.document is original and editor._preview.draft is None and not editor.undo.canUndo()
     QTimer.singleShot(0, lambda: adjust(True))
     action(editor, "Color adjustments…").trigger()
     assert editor.active_layer.adjustments == (20, 10, -30)
-    assert previews[0] == previews[1] == render(editor.document).getpixel((12, 12))
+    assert previews[0] == previews[1]
+    assert max(abs(a - b) for a, b in zip(previews[0], render(editor.document).getpixel((12, 12)))) <= 3
     assert previews[0][:3] != (100, 45, 20) and previews[0][3] == 200
     editor.undo.undo()
     assert editor.document is original
@@ -288,6 +571,10 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
         if prompt == "Cancel":
             assert cancelled.wait(5)
             raise Cancelled("Generation canceled.")
+        if prompt == "Sign in":
+            raise AuthRequired("Sign in required.")
+        if prompt == "Quota":
+            raise QuotaPaused(2_000_000_000)
         side = max(base.size)
         return FillCandidate(Image.new("RGBA", (side, side)), {
             "crop": (0, 0, side, side), "shift": (0, 0), "color": (0, 0, 0), "feather": 1,
@@ -316,10 +603,16 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
     assert render(variant.document).getpixel((22, 24)) == (255, 0, 0, 255)
     assert render(variant.document).getpixel((31, 23)) == (0, 128, 0, 255)
     fill._apply.click()
+    idle(window)
+    assert window.task_status.text() == "Applied to the active layer “Active”. Undo with Ctrl+Z."
     assert editor.active_layer.id == active_id and len(editor.document.layers) == 3
     assert render(editor.document).tobytes() == render(variant.document).tobytes()
-    editor.undo.undo()
+    window.activateWindow()
+    QApplication.processEvents()
+    assert editor.canvas.hasFocus()
+    QTest.keyClick(editor.canvas, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
     assert editor.document is before
+    assert not window.task_status.text()
 
     editor.fill_button.click()
     idle(window)
@@ -327,9 +620,20 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
     fill._alpha.setChecked(True)
     fill._prompt.setText("Cancel")
     fill._generate.click()
+    assert window.task_status.text() == "Generating variation…"
     fill._cancel.click()
+    assert window.task_status.text() == "Cancelling…" and not fill._cancel.isEnabled()
     idle(window)
+    assert window.task_status.text() == "Generation canceled." and window.task_progress.isHidden()
     assert fill.selected_variant is None and editor.document is before
+    fill._prompt.setText("Sign in")
+    fill._generate.click()
+    idle(window)
+    assert "Run codex login" in window.task_status.text()
+    fill._prompt.setText("Quota")
+    fill._generate.click()
+    idle(window)
+    assert window.task_status.text().startswith("Codex usage limit reached. Try again after ")
     fill._discard.click()
     assert window.stack.currentWidget() is editor and editor.document is before
     editor.fill_button.click()
@@ -339,10 +643,77 @@ def test_fill_destination_preview_commit_and_cancellation(window, monkeypatch):
     fill._generate.click()
     idle(window)
     fill._apply.click()
+    idle(window)
+    assert window.task_status.text() == "Applied to a new layer “Generative Fill”. Undo with Ctrl+Z."
     assert len(editor.document.layers) == 4 and editor.active_layer.coverage is not None
     assert render(editor.document).getpixel((22, 24)) == (0, 0, 0, 0)
     editor.undo.undo()
     assert editor.document is before
+
+
+@pytest.mark.parametrize("active_layer", [False, True])
+def test_prompted_transparent_background_applies_with_alpha(window, monkeypatch, active_layer):
+    original = desktop.Document.from_image(Image.new("RGB", (96, 96), "red"), "Base")
+    window._show_document(original)
+    editor = window.editor
+    choose_tool(editor, "lasso")
+    gesture(editor.canvas, (10, 10), (85, 10), (10, 85), (10, 10))
+    prompt = "Gere um objeto azul com fundo transparente."
+
+    class Generator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def generate(self, instructions, references, *, verify_references, output_schema):
+            assert verify_references and "transparency" in output_schema["required"]
+            assert prompt in instructions and "transparent_background=true" in instructions
+            with Image.open(references[0]) as reference:
+                assert reference.mode == "RGB"
+            image = Image.new("RGBA", (96, 96))
+            image.paste((0, 0, 255, 180), (22, 22, 40, 40))
+            image.paste((0, 255, 0, 255), (60, 60, 80, 80))
+            output = io.BytesIO()
+            image.save(output, format="PNG")
+            return GeneratedImage(output.getvalue(), "fill-test", True, transparent_background=True,
+                                  final_message='{"transparency":"background"}')
+
+    generate = desktop.generate_fill
+
+    def generate_with_fixture(*args, **kwargs):
+        return generate(*args, **kwargs, client_factory=Generator)
+
+    monkeypatch.setattr(desktop, "generate_fill", generate_with_fixture)
+    monkeypatch.setattr(window, "_codex_resolver", lambda: lambda: Path("mock-codex.exe"))
+    editor.fill_button.click()
+    idle(window)
+    fill = window.layer_fill.editor
+    assert not fill._alpha.isChecked()
+    fill._destination.setCurrentIndex(int(active_layer))
+    fill._prompt.setText(prompt)
+    fill._generate.click()
+    idle(window)
+    assert fill._apply.isEnabled(), fill._status.text()
+    variant = window.layer_fill.variants[0]
+    fill._apply.click()
+    idle(window)
+    layer = editor.active_layer
+    assert layer.coverage is None
+    assert layer.image.getpixel((30 - layer.x, 30 - layer.y)) == (0, 0, 255, 180)
+    assert layer.image.getpixel((15 - layer.x, 15 - layer.y)) == (0, 0, 0, 0)
+    assert layer.image.getpixel((70 - layer.x, 70 - layer.y)) == (
+        (255, 0, 0, 255) if active_layer else (0, 0, 0, 0)
+    )
+    assert len(editor.document.layers) == (1 if active_layer else 2)
+    assert variant.preview.compose(render(original)).tobytes() == render(editor.document).tobytes()
+    if not active_layer:
+        assert editor.document.layers[0] is original.layers[0]
+        assert render(editor.document).getpixel((15, 15)) == (255, 0, 0, 255)
 
 
 def test_reconstruction_resumes_snapshot_and_opens_result(window, tmp_path):
@@ -382,3 +753,250 @@ def test_reconstruction_resumes_snapshot_and_opens_result(window, tmp_path):
     assert window.stack.currentWidget() is editor
     assert editor.document.id != document_id and editor.document.size == job.layout.size
     assert editor.active_layer.image.getpixel((100, 20)) == (0, 0, 128, 255)
+
+
+def test_task_feedback_for_open_save_and_failed_export(window, tmp_path, monkeypatch):
+    project = tmp_path / "Project.regimagen"
+    document = desktop.Document.from_image(Image.new("RGBA", (24, 24)), "Base.png")
+    desktop.save_project(document, project)
+    release = Event()
+
+    def slow_load(path, *, cancelled):
+        assert release.wait(5)
+        return load_project(path, cancelled=cancelled)
+
+    monkeypatch.setattr(desktop, "load_project", slow_load)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_, **_options: (str(project), ""))
+    window.open_action.trigger()
+    try:
+        assert window.task_status.isVisible() and window.task_status.text() == "Opening project…"
+        assert window.task_progress.isVisible() and window.task_progress.maximum() == 0
+        assert not window.empty_button.isEnabled()
+    finally:
+        release.set()
+    idle(window)
+    assert window.task_status.text() == "Opened Project.regimagen" and window.task_progress.isHidden()
+    window.save_action.trigger()
+    assert window.task_status.text() == "Saving project…"
+    idle(window)
+    assert window.task_status.text() == "Saved Project.regimagen" and window.open_folder.isVisible()
+    opened = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(Path(url.toLocalFile())) or True)
+    window.open_folder.click()
+    assert opened == [tmp_path]
+
+    window.editor.reconstruct_button.click()
+    idle(window)
+    window.generate.click()
+    idle(window)
+    assert window.export.isEnabled()
+    destination = tmp_path / "reconstruction.png"
+    monkeypatch.setattr(QFileDialog, "exec", lambda _dialog: 1)
+    monkeypatch.setattr(QFileDialog, "selectedFiles", lambda _dialog: [str(destination)])
+    release.clear()
+    export = desktop.export_png
+
+    def broken_export(*_args, progress, **_kwargs):
+        progress(3, 5)
+        assert release.wait(5)
+        raise PermissionError("The destination is read-only.")
+
+    monkeypatch.setattr(desktop, "export_png", broken_export)
+    window.export.click()
+    try:
+        wait_for(lambda: window.task_status.text() == "Exporting PNG · 60%")
+        assert window.task_progress.value() == 3 and window.task_progress.maximum() == 5
+        assert window.status.text() == "4/4 ready"
+    finally:
+        release.set()
+    idle(window)
+    assert "Export failed." in window.task_status.text() and "choose another folder" in window.task_status.text()
+    assert window.task_progress.isHidden() and window.open_folder.isHidden()
+    assert window.export.isEnabled() and not destination.exists()
+    monkeypatch.setattr(desktop, "export_png", export)
+    window.export.click()
+    idle(window)
+    assert window.task_status.text() == "Exported reconstruction.png" and window.open_folder.isVisible()
+    assert destination.is_file()
+
+    destination = next(iter(window.store.snapshot(window.job).current_artifacts.values()))
+    saved_tile = destination.read_bytes()
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "information", lambda _parent, _title, message: warnings.append(message))
+    window.export.click()
+    assert window.task is None and warnings and "managed files" in warnings[0]
+    assert destination.read_bytes() == saved_tile
+
+
+def test_preview_and_regeneration_report_the_requested_tiles(window, monkeypatch):
+    document = desktop.Document.from_image(Image.new("RGB", (32, 32), "red"), "Base.png")
+    window._show_document(document)
+    window.editor.reconstruct_button.click()
+    idle(window)
+    job = window.store.ensure_job(window.source, Grid(4, 4))
+    window._show_grid(job.grid, job)
+    preview = job.layout.preview()
+
+    def save_tile(cell, attempt):
+        window.store.begin_tile(job, cell, attempt)
+        Image.new("RGB", (FRAME, FRAME), "navy").save(job.folder / f"{attempt}.png")
+        window.store.finish_tile(job, cell, attempt, "mock", None, {})
+
+    save_tile(preview[0], "cached")
+    release = Event()
+    requests = []
+
+    def generate(_store, _job, cells, _executable, *, on_change, **_kwargs):
+        requests.append(tuple(cells))
+        on_change(cells[0])
+        assert release.wait(5)
+        for index, cell in enumerate(cells):
+            save_tile(cell, f"request-{len(requests)}-tile-{index}")
+        on_change(None)
+        return jobs.RunOutcome()
+
+    monkeypatch.setattr(desktop, "run_tiles", generate)
+    window.preview.click()
+    try:
+        wait_for(lambda: window.active is not None)
+        assert window.task_status.text() == "Preview 2×2 · 1/4 tiles ready"
+        assert window.task_progress.value() == 1 and window.task_progress.maximum() == 4
+        assert window.status.text() == "1/16 ready"
+        window.grid_map.picked.emit(Cell(0, 0))
+        assert window.task_status.text() == "Preview 2×2 · 1/4 tiles ready"
+    finally:
+        release.set()
+    idle(window)
+    assert requests == [preview[1:]] and window.status.text() == "4/16 ready"
+    assert window.task_status.text().startswith("Preview ready.")
+
+    release.clear()
+    window.grid_map.picked.emit(preview[0])
+    window.retry.click()
+    try:
+        wait_for(lambda: window.active is not None)
+        assert window.task_status.text() == f"Regenerating tile · {preview[0].label}"
+        assert window.task_progress.value() == 0 and window.task_progress.maximum() == 1
+    finally:
+        release.set()
+    idle(window)
+    assert requests[-1] == (preview[0],)
+    assert "Tile regenerated" in window.task_status.text()
+
+
+def test_preview_recovery_keeps_the_requested_region_when_the_quota_time_is_unavailable(window, monkeypatch):
+    document = desktop.Document.from_image(Image.new("RGB", (32, 32), "red"), "Base.png")
+    window._show_document(document)
+    window.editor.reconstruct_button.click()
+    idle(window)
+    window._show_grid(Grid(4, 4))
+    preview = window.image_layout.preview()
+    release = Event()
+    requests = []
+
+    def generate(store, job, cells, _executable, *, on_change, **_kwargs):
+        requests.append(tuple(cells))
+        on_change(cells[0])
+        assert release.wait(5)
+        store.set_notice(job, "Codex has reached its usage limit.", "unknown")
+        return jobs.RunOutcome("quota_limited", quota_reset="unknown")
+
+    monkeypatch.setattr(desktop, "run_tiles", generate)
+    window.preview.click()
+    try:
+        wait_for(lambda: window.active is not None)
+        window.grid_map.picked.emit(Cell(0, 0))
+    finally:
+        release.set()
+    idle(window)
+    assert window.task_progress.isHidden()
+    assert "Resume when the limit resets." in window.task_status.text()
+    assert f"Select {preview[0].label.lower()}" in window.task_status.text()
+
+    window._show_grid(window.grid, window.job)
+    assert "Codex has reached its usage limit." in window.status.text()
+    window.grid_map.picked.emit(preview[0])
+    window.preview.click()
+    idle(window)
+    assert requests == [preview, preview]
+
+
+@pytest.mark.parametrize(("chained", "conflict_scale"), [(False, None), (False, 2), (True, 2), (True, 3)])
+def test_scale_batch_reports_stage_and_resumes_in_the_same_folder(window, tmp_path, monkeypatch, chained, conflict_scale):
+    document = desktop.Document.from_image(Image.new("RGBA", (24, 24)), "Base.png")
+    window._show_document(document)
+    window.editor.reconstruct_button.click()
+    idle(window)
+    window.settings.setValue("scales", "2, 3, 4")
+    window.settings.setValue("chainedScales", chained)
+    monkeypatch.setattr(QDialog, "exec", lambda _dialog: 1)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *_, **_options: str(tmp_path))
+    run_tiles = jobs.run_tiles
+    pause_once = Event()
+
+    def generate(store, job, cells, executable, *, pause, **kwargs):
+        if job.scale == 3 and not pause_once.is_set():
+            assert pause.wait(5)
+            pause_once.set()
+        return run_tiles(store, job, cells, executable, pause=pause, **kwargs)
+
+    monkeypatch.setattr(jobs, "run_tiles", generate)
+    export_png = jobs.export_png
+    exported_scales = []
+
+    def export(layout, *args, **kwargs):
+        exported_scales.append(layout.scale)
+        return export_png(layout, *args, **kwargs)
+
+    monkeypatch.setattr(jobs, "export_png", export)
+    window.batch.click()
+    wait_for(lambda: window.task_status.text().startswith("Scale 2/3 · 3×"))
+    window.generate.click()
+    assert window.task_status.text().startswith("Pausing") and not window.generate.isEnabled()
+    idle(window)
+    assert "Scale batch paused." in window.task_status.text() and "Exported 1/3 PNGs." in window.task_status.text()
+    folder = window.output_folder
+    assert folder is not None and (folder / "Base-2x.png").is_file()
+    assert window.generate.text() == "Resume batch" and window.generate.isEnabled()
+    if conflict_scale is not None:
+        conflicting_file = folder / f"Base-{conflict_scale}x.png"
+        Image.new("RGB", (24 * conflict_scale, 24 * conflict_scale), "blue").save(conflicting_file)
+        edited = conflicting_file.read_bytes()
+        window.generate.click()
+        idle(window)
+        assert conflicting_file.read_bytes() == edited
+        assert conflicting_file.name in window.task_status.text() and "Move or rename" in window.task_status.text()
+        assert window.output_folder == folder and window.open_folder.isVisible()
+        assert window.generate.text() == "Resume batch" and window.generate.isEnabled()
+        preserved_file = conflicting_file.rename(conflicting_file.with_suffix(".edited"))
+    window.generate.click()
+    idle(window)
+    assert window.task_status.text() == "Scale batch complete. Exported 3/3 PNGs."
+    assert window.output_folder == folder
+    assert exported_scales == ([2, 2, 3, 4] if conflict_scale == 2 and not chained else [2, 3, 4])
+    assert sorted(path.name for path in folder.glob("*.png")) == ["Base-2x.png", "Base-3x.png", "Base-4x.png"]
+    if conflict_scale is not None:
+        assert preserved_file.read_bytes() == edited
+
+
+def test_canvas_hint_tracks_missing_hidden_and_locked_layers(window):
+    window._show_document(desktop.Document("Untitled", 24, 24))
+    editor = window.editor
+    choose_tool(editor, "brush")
+    assert editor.tool_hint.text() == "Add a layer to use Brush." and editor.tool_hint.isVisible()
+    editor.add_image(Image.new("RGBA", (24, 24)), "Pixels")
+    assert editor.tool_hint.isHidden()
+    editor.layers.setCurrentRow(-1)
+    assert "Select a layer" in editor.tool_hint.text()
+    editor.layers.setCurrentRow(0)
+    editor.layers.currentItem().setCheckState(Qt.CheckState.Unchecked)
+    assert "Turn on visibility" in editor.tool_hint.text()
+    editor.layers.currentItem().setCheckState(Qt.CheckState.Checked)
+    editor.locked.setChecked(True)
+    assert "Turn off Lock layer" in editor.tool_hint.text()
+    choose_tool(editor, "pan")
+    assert editor.tool_hint.isHidden()
+    choose_tool(editor, "eraser")
+    assert "Turn off Lock layer" in editor.tool_hint.text()
+    editor.locked.setChecked(False)
+    assert editor.tool_hint.isHidden()

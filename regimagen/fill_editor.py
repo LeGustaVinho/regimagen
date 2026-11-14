@@ -211,9 +211,10 @@ class FillEditor(QWidget):
     def can_apply(self) -> bool:
         return self.selected_variant is not None and not self._chooser.currentData()
 
-    def set_busy(self, busy: bool, *, generating: bool = False):
+    def set_busy(self, busy: bool, *, generating: bool = False, cancelling: bool = False):
         self._busy = busy
         self._generating = busy and generating
+        self._cancel.setEnabled(not cancelling)
         self._canvas.set_drawing_enabled(not busy)
         self._refresh()
 
@@ -235,7 +236,7 @@ class FillEditor(QWidget):
         with QSignalBlocker(self._chooser):
             self._chooser.addItem("Saved variation" if already_applied else f"Variation {count}", already_applied)
             self._chooser.setCurrentIndex(count - 1)
-        self._after.setChecked(True)
+        self._select_generated_view()
         self._show_preview()
         self._refresh()
 
@@ -267,25 +268,36 @@ class FillEditor(QWidget):
         self._before.setChecked(True)
         self._show_preview()
 
+    def _select_generated_view(self):
+        self._after.setChecked(True)
+
     def _select_variant(self, index: int):
         if index >= 0:
-            self._after.setChecked(True)
+            self._select_generated_view()
         self._show_preview()
         self._refresh()
 
     def _show_preview(self):
         index = self.selected_variant
-        showing_after = self._after.isChecked() and index is not None
+        preview = self._variants[index] if self._after.isChecked() and index is not None else None
+        self._display_preview(preview)
+
+    def _display_preview(self, preview: FillPreview | None):
         display = self._base
-        if showing_after:
-            preview = self._variants[index]
+        if preview is not None:
             display = QPixmap(self._base)
             painter = QPainter(display)
             # Replace the base alpha as well so a cutout reveals the checkerboard.
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
             painter.drawPixmap(*preview.origin, pixmap(preview.patch))
             painter.end()
-        self._canvas.set_image(display, selection_visible=not showing_after)
+        self._canvas.set_image(display, selection_visible=preview is None)
+
+    def _variant_message(self, index: int) -> str:
+        warning = self._variants[index].warning
+        if not self.can_apply:
+            return f"This variation is already applied. {warning}".strip()
+        return warning or "Variation ready. Use Before and After to compare."
 
     def _refresh(self):
         selected = self._bounds is not None
@@ -315,7 +327,6 @@ class FillEditor(QWidget):
             elif not can_generate:
                 message = TRANSPARENT_SELECTION
             elif index is not None:
-                warning = self._variants[index].warning
-                message = warning if self.can_apply else f"This variation is already applied. {warning}".strip()
+                message = self._variant_message(index)
         self._status.setText(message)
-        self._status.setVisible(bool(message))
+        self._status.setVisible(bool(message) and not self._busy)

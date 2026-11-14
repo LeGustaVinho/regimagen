@@ -1,4 +1,5 @@
 import io
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
+from regimagen import remove_detection
 from regimagen.codex import Cancelled, GeneratedImage
 from regimagen.fill import SELECTION_MARK, FillCandidate, generate_fill, render_fill
 from regimagen.geometry import FRAME
@@ -33,7 +35,7 @@ class FillClient:
     def __exit__(self, *_):
         pass
 
-    def generate(self, prompt, references, *, verify_references=False):
+    def generate(self, prompt, references, *, verify_references=False, output_schema=None):
         assert verify_references
         source, selection, context = references
         with Image.open(source) as target, Image.open(selection) as guide, Image.open(context) as overview:
@@ -79,6 +81,51 @@ def test_frame_is_square_and_first_input_is_source_even_at_canvas_edge():
     outside = np.asarray(mask) == 0
     np.testing.assert_array_equal(result[outside], np.asarray(base)[outside])
     assert tuple(result[50, 6]) == (0, 0, 255)
+
+
+def test_wide_fill_guides_placement_with_real_canvas_and_nearby_style():
+    base = Image.new("RGB", (600, 600), (64, 139, 201))
+    base.paste((67, 91, 24), (0, 360, 600, 600))
+    mask = Image.new("L", base.size)
+    mask.paste(255, (85, 0, 535, 140))
+    client = FillClient(lambda _prompt, reference, *_: _png(reference))
+    result = _generate(base, mask, client)
+    prompt, reference, guide, context = client.calls[0]
+
+    assert result.metadata["crop"] == [0, 0, 600, 600]
+    assert "rendering medium" in prompt and "amber line" in prompt
+    assert reference.getpixel((FRAME // 2, FRAME - 10)) == (67, 91, 24)
+    assert np.any(np.all(np.asarray(guide) == (255, 174, 47), axis=2))
+    nearby, overview = np.split(np.asarray(context), 2, axis=1)
+    assert not np.any(np.all(nearby == (67, 91, 24), axis=2))
+    assert np.any(np.all(overview == (67, 91, 24), axis=2))
+
+
+def test_wide_fill_softens_a_large_tone_jump_without_changing_pixels_outside():
+    base = Image.new("RGB", (720, 720), (135, 184, 228))
+    mask = Image.new("L", base.size)
+    mask.paste(255, (65, 0, 655, 200))
+    candidate = _candidate(Image.new("RGB", base.size, (34, 56, 99)), feather=12)
+    output = np.asarray(render_fill(base, mask, candidate, edit_alpha=False).compose(base))
+
+    outside = np.asarray(mask) == 0
+    np.testing.assert_array_equal(output[outside], np.asarray(base)[outside])
+    assert tuple(output[130, 360]) == (34, 56, 99)
+    assert tuple(output[199, 360]) == (135, 184, 228)
+    assert np.abs(np.diff(output[157:204, 360].astype(np.int16), axis=0)).max() <= 8
+
+
+def test_wide_fill_matches_smooth_sky_tones_without_grading_the_added_cloud():
+    base = Image.new("RGB", (720, 720), (88, 150, 210))
+    mask = Image.new("L", base.size)
+    mask.paste(255, (65, 0, 655, 200))
+    generated = Image.new("RGB", base.size, (101, 170, 230))
+    generated.paste((50, 65, 90), (235, 35, 480, 126))
+    output = render_fill(base, mask, _candidate(generated, feather=12), edit_alpha=False).compose(base)
+
+    border = np.asarray(output)[185, 200].astype(np.int16)
+    assert np.abs(border - base.getpixel((200, 185))).max() <= 4
+    assert output.getpixel((360, 80)) == (50, 65, 90)
 
 
 def test_sprite_context_shows_neighborhood_and_global_subject():
@@ -151,6 +198,88 @@ def test_accepts_encoded_opaque_alpha_and_rejects_missing_alpha_or_wrong_shape()
     malformed = FillClient(lambda *_: _png(Image.new("RGBA", (64, 65))))
     with pytest.raises(ValueError, match="non-square"):
         _generate(base, mask, malformed, edit_alpha=True)
+
+
+@pytest.mark.parametrize("mode", ["RGB", "RGBA"])
+def test_transparent_fill_isolates_the_subject_if_imagegen_retains_scenery(monkeypatch, mode):
+    base = Image.new("RGB", (112, 112), "green")
+    selection = Image.new("L", base.size)
+    selection.paste(255, (12, 12, 100, 100))
+    generated = Image.new("RGB", base.size, (25, 100, 210))
+    generated.paste((230, 54, 35), (30, 26, 80, 86))
+    generated.paste((25, 100, 210), (64, 48, 69, 60))
+    if mode == "RGBA":
+        # The only near-transparent pixels are above the selection.
+        alpha = Image.new("L", base.size, 251)
+        alpha.paste(1, (0, 0, 112, 6))
+        generated.putalpha(alpha)
+    prompt = "Crie um robo com fundo transparente"
+    image_generation_modes = []
+    foreground_counts = []
+
+    class Client(FillClient):
+        def __call__(self, executable, directory, *, cancelled, image_generation=True):
+            image_generation_modes.append(image_generation)
+            return self
+
+        def generate(self, instructions, references, *, verify_references, output_schema):
+            assert "alpha to zero throughout the remaining square" in instructions
+            result = super().generate(instructions, references, verify_references=verify_references,
+                                      output_schema=output_schema)
+            return replace(result, final_message='{"transparency":"background"}', transparent_background=True)
+
+        def analyze_images(self, instructions, references, schema, *, effort):
+            assert prompt in instructions and "foreground to keep" in instructions
+            assert effort == "low"
+            assert [path.name for path in references] == ["detail.png", "overview.png"]
+            assert set(schema["properties"]) == {"targets"}
+            return {"targets": [{
+                "label": "robot", "view": "detail", "bounds": [260, 220, 730, 780],
+                "foreground": [[450, 400], [610, 660]], "background": [[210, 350], [820, 700]],
+            }]}
+
+    class Segmenter:
+        def segment(self, image, bounds, foreground, background):
+            foreground_counts.append(len(foreground))
+            if mode == "RGBA" and len(foreground) > 1:
+                return None
+            matte = (image[..., 0] > 200).astype(np.uint8)
+            x, y = foreground[0]
+            # Simulate a small hole in the segmentation over opaque material.
+            matte[y - 1:y + 2, x + 4:x + 7] = 0
+            return matte
+
+    monkeypatch.setattr(remove_detection, "_EfficientSAM", Segmenter)
+    client = Client(lambda *_: _png(generated))
+    candidate = generate_fill(base, selection, prompt, False, Path("codex"), cancelled=Event(),
+                              client_factory=client)
+    assert image_generation_modes == [True, False]
+    assert foreground_counts == ([2, 1] if mode == "RGBA" else [2])
+    assert candidate.transparent_background and candidate.image.getpixel((20, 50))[3] == 0
+    assert candidate.image.getpixel((55, 44))[3] >= 245
+    assert candidate.image.getpixel((66, 54))[3] == 0
+    preview = render_fill(base, selection, candidate, edit_alpha=False, isolated_layer=True)
+    assert preview.patch.getpixel((40, 40)) == (230, 54, 35, 251 if mode == "RGBA" else 255)
+    assert preview.patch.getpixel((8, 40)) == (0, 0, 0, 0)
+
+
+def test_transparent_fill_clears_residual_low_alpha_without_foreground_detection():
+    base = Image.new("RGB", (96, 96), "green")
+    selection = Image.new("L", base.size)
+    selection.paste(255, (10, 10, 86, 86))
+    generated = Image.new("RGBA", base.size, (15, 30, 50, 3))
+    generated.paste((200, 95, 25, 210), (30, 25, 60, 70))
+    generated.putpixel((29, 50), (200, 95, 25, 75))
+
+    class Client(FillClient):
+        def generate(self, *args, **kwargs):
+            return replace(super().generate(*args, **kwargs), final_message='{"transparency":"background"}')
+
+    candidate = generate_fill(base, selection, "Transparent background", False, Path("codex"),
+                              cancelled=Event(), client_factory=Client(lambda *_: _png(generated)))
+    assert candidate.image.getpixel((15, 15))[3] == 0
+    assert candidate.image.getpixel((29, 50)) == (200, 95, 25, 75)
+    assert candidate.image.getpixel((40, 50)) == (200, 95, 25, 210)
 
 
 def test_locked_transparent_selection_does_not_call_generator():

@@ -64,10 +64,13 @@ class ImageView(QGraphicsView):
             return
         pos = position if position is not None else self.viewport().rect().center()
         anchor = self.mapToScene(pos)
-        scale = max(min(0.1, self.fit_scale()), min(8.0, self.transform().m11() * factor))
+        scale = max(self.minimum_scale(), min(8.0, self.transform().m11() * factor))
         self.setTransform(QTransform.fromScale(scale, scale))
         self.centerOn(self.center() + anchor - self.mapToScene(pos))
         self.moved.emit()
+
+    def minimum_scale(self):
+        return min(0.1, self.fit_scale())
 
     def wheelEvent(self, event):
         self.zoom(1.2 ** (event.angleDelta().y() / 120), event.position().toPoint())
