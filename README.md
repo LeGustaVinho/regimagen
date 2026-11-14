@@ -31,11 +31,11 @@ Use the preview and seam review to check generated tiles before committing to a 
 
 ## Quick start
 
-1. To follow this guide on the current branch, [build the portable Windows ZIP](#develop-from-source) and extract the whole folder. Keep `_internal` beside the executables. The ZIP bundles the Python runtime and application dependencies. Published downloads follow their corresponding GitHub release tags.
-2. Open `Regimagen.exe` on Windows 10 or 11 x64. Drop in a still PNG, JPEG, WebP, or `.regimagen` project. To start from transparency, choose **New canvas**.
+1. [Download the portable Windows ZIP](https://github.com/LeGustaVinho/regimagen/releases/latest/download/Regimagen-Windows-x64.zip) and extract the whole folder. Keep `_internal` beside the executables. The ZIP bundles the Python runtime and application dependencies. [Build from source](#develop-from-source) to try changes on a development branch.
+2. Open `Regimagen.exe` on Windows 10 or 11 x64. Drop in a still PNG, JPEG, WebP, or `.regimagen` project. To start from transparency, choose **New canvas**. Use **Cancel** in the task bar to stop opening a file and keep the current document.
 3. Use **Add layer** to import another image or create a paintable layer. Choose **File → Save project** to keep your layers, or **File → Export image** to publish the composition.
 4. Install Codex CLI and run `codex login` for **Generative Fill**, **Reconstruct**, and the parts of **Generative Remove** that use visual analysis or background reconstruction. If automatic detection misses it, choose the executable from the **Codex CLI** menu. [Codex CLI documentation](https://developers.openai.com/codex/cli/)
-5. In **Reconstruct**, run **Generate 2×2 preview**, inspect the result, then choose **Generate image**. Use **Open result in editor** to work on the completed image at its generated size. You can also export the PNG or a ZIP of tiles.
+5. In **Reconstruct**, run **Generate 2×2 preview**, inspect the result, then choose **Generate image**. If a run is interrupted, use the retry action in the task bar to resume the same region. Use **Open result in editor** to work on the completed image at its generated size. You can also export the PNG or a ZIP of tiles.
 
 ## Generative Remove
 
