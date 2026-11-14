@@ -857,6 +857,27 @@ def test_task_feedback_for_open_save_and_failed_export(window, tmp_path, monkeyp
     assert "Export failed." in window.task_status.text() and "choose another folder" in window.task_status.text()
     assert window.task_progress.isHidden() and window.open_folder.isHidden()
     assert window.export.isEnabled() and not destination.exists()
+    release.clear()
+
+    def canceled_export(*_args, progress, cancelled, **_kwargs):
+        progress(2, 5)
+        assert release.wait(5)
+        assert cancelled()
+        raise Cancelled("Export canceled.")
+
+    monkeypatch.setattr(desktop, "export_png", canceled_export)
+    window.export.click()
+    try:
+        wait_for(lambda: window.task_status.text() == "Exporting PNG · 40%")
+        assert window.cancel_task.isEnabled() and window.cancel_task.isVisible()
+        window.cancel_task.click()
+        assert window.task_status.text() == "Cancelling…" and not window.cancel_task.isEnabled()
+    finally:
+        release.set()
+    idle(window)
+    assert window.task_status.text() == "Export canceled."
+    assert window.cancel_task.isHidden() and not destination.exists()
+
     monkeypatch.setattr(desktop, "export_png", export)
     window.export.click()
     idle(window)
@@ -870,6 +891,34 @@ def test_task_feedback_for_open_save_and_failed_export(window, tmp_path, monkeyp
     window.export.click()
     assert window.task is None and warnings and "managed files" in warnings[0]
     assert destination.read_bytes() == saved_tile
+
+
+
+def test_cancel_open_preserves_the_current_document(window, tmp_path, monkeypatch):
+    current = desktop.Document.from_image(Image.new("RGB", (24, 24), "red"), "Current.png")
+    window._show_document(current)
+    release = Event()
+    opened = tmp_path / "Slow.png"
+    opened.touch()
+
+    def load(_path):
+        assert release.wait(5)
+        return Image.new("RGB", (24, 24), "navy")
+
+    monkeypatch.setattr(desktop, "load_source", load)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_, **_options: (str(opened), ""))
+    window.open_action.trigger()
+    try:
+        assert window.task_status.text() == "Opening image…"
+        assert window.cancel_task.isEnabled() and window.cancel_task.isVisible()
+        window.cancel_task.click()
+        assert window.task_status.text() == "Cancelling…" and not window.cancel_task.isEnabled()
+    finally:
+        release.set()
+    idle(window)
+    assert window.task_status.text() == "Open canceled."
+    assert window.editor.document is current
+    assert window.task_progress.isHidden() and window.cancel_task.isHidden()
 
 
 def test_preview_and_regeneration_report_the_requested_tiles(window, monkeypatch):
@@ -955,14 +1004,15 @@ def test_preview_recovery_keeps_the_requested_region_when_the_quota_time_is_unav
     idle(window)
     assert window.task_progress.isHidden()
     assert "Resume when the limit resets." in window.task_status.text()
-    assert f"Select {preview[0].label.lower()}" in window.task_status.text()
+    assert preview[0].label.lower() in window.task_status.text()
+    assert window.retry_task.isVisible() and window.retry_task.isEnabled()
+    window.retry_task.click()
+    idle(window)
+    assert requests == [preview, preview]
 
     window._show_grid(window.grid, window.job)
     assert "Codex has reached its usage limit." in window.status.text()
-    window.grid_map.picked.emit(preview[0])
-    window.preview.click()
-    idle(window)
-    assert requests == [preview, preview]
+    assert window.retry_task.isHidden()
 
 
 @pytest.mark.parametrize(("chained", "conflict_scale"), [(False, None), (False, 2), (True, 2), (True, 3)])

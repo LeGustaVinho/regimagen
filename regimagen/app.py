@@ -314,6 +314,8 @@ class Window(QMainWindow):
         self.closing = False
         self.scale_batch: ScaleBatch | None = None
         self.output_folder: Path | None = None
+        self.can_cancel_task = False
+        self.recover_task: Callable[[], None] | None = None
         self.setWindowTitle("Regimagen")
         self.setWindowIcon(QIcon(logo()))
         self.setAcceptDrops(True)
@@ -454,6 +456,14 @@ class Window(QMainWindow):
         self.task_progress.setFixedSize(128, 6)
         self.task_progress.hide()
         row.addWidget(self.task_progress)
+        self.cancel_task = QPushButton("Cancel")
+        self.cancel_task.clicked.connect(self._request_cancel)
+        self.cancel_task.hide()
+        row.addWidget(self.cancel_task)
+        self.retry_task = QPushButton()
+        self.retry_task.clicked.connect(self._recover_task)
+        self.retry_task.hide()
+        row.addWidget(self.retry_task)
         self.open_folder = QPushButton("Open folder")
         self.open_folder.setObjectName("openOutputFolder")
         self.open_folder.clicked.connect(self._open_output_folder)
@@ -1171,7 +1181,7 @@ class Window(QMainWindow):
                 copyfileobj(source, out)
             return destination
 
-        self._launch("export_fill", save, self._export_finished, message="Exporting source PNG…")
+        self._launch("export_fill", save, self._export_finished, message="Exporting source PNG…", cancellable=True)
 
     def _can_open(self):
         return self.task is None and self.fill is None and self.layer_fill is None and self.pattern is None
@@ -1244,7 +1254,9 @@ class Window(QMainWindow):
         project = path.resolve() if path.suffix.lower() == PROJECT_SUFFIX else None
 
         def load(_update, _pause, cancel):
-            return load_project(project, cancelled=cancel.is_set) if project else Document.from_image(load_source(path), path.name)
+            if project is not None:
+                return load_project(project, cancelled=cancel.is_set)
+            return Document.from_image(load_source(path), path.name)
 
         def show(document):
             self._show_document(document, project)
@@ -1253,7 +1265,7 @@ class Window(QMainWindow):
 
         def open_document():
             message = "Opening project…" if project else "Opening image…"
-            self._launch("open_document", load, show, message=message)
+            self._launch("open_document", load, show, message=message, cancellable=True, discard_on_cancel=True)
 
         if self._confirm_replace(open_document):
             open_document()
@@ -1352,7 +1364,7 @@ class Window(QMainWindow):
             self._history()
             self.after_task = after_save
 
-        self._launch("save_project", save, saved, message="Saving project…")
+        self._launch("save_project", save, saved, message="Saving project…", cancellable=True)
 
     def _export_document(self):
         if not self._can_open() or self.stack.currentWidget() is not self.editor:
@@ -1381,7 +1393,7 @@ class Window(QMainWindow):
 
         self._launch(
             "export_document", save, self._export_finished, lambda counts: self._file_progress(label, counts),
-            message=f"{label}…",
+            message=f"{label}…", cancellable=True,
         )
 
     def _reconstruct(self):
@@ -1426,7 +1438,10 @@ class Window(QMainWindow):
             return Document.from_image(image, source.name)
 
         def open_document():
-            self._launch("open_document", load, self._show_document, message="Opening image…")
+            self._launch(
+                "open_document", load, self._show_document, message="Opening image…",
+                cancellable=True, discard_on_cancel=True,
+            )
 
         if self._confirm_replace(open_document):
             open_document()
@@ -1451,7 +1466,7 @@ class Window(QMainWindow):
         def open_document():
             self._launch(
                 "open_result", load, self._show_document, lambda counts: self._file_progress("Rendering result", counts),
-                message="Rendering result…",
+                message="Rendering result…", cancellable=True, discard_on_cancel=True,
             )
 
         if self._confirm_replace(open_document):
@@ -1771,11 +1786,16 @@ class Window(QMainWindow):
         def update(active):
             self._generation_update(active, label, selection, previous=previous)
 
+        def recover():
+            if self.job == job:
+                self._start(selection, preview=preview, replace=replace)
+
         def finished(outcome):
-            resume = f"Use {action} to continue."
-            if preview or replace:
-                resume = f"Select {selection[0].label.lower()} in the grid, then use {action} to continue."
-            self._set_feedback(self._run_message(outcome, subject, success, resume))
+            retry = (action, recover) if outcome.state != "completed" else None
+            message = self._run_message(outcome, subject, success, "")
+            if retry is not None and (preview or replace):
+                message += f" Target starts at {selection[0].label.lower()}." if preview else f" {selection[0].label}."
+            self._set_feedback(message, recovery=retry)
 
         ready, total = len(selection) - len(cells), len(selection)
         self._launch(
@@ -1971,12 +1991,14 @@ class Window(QMainWindow):
         if outcome.state == "completed":
             return success
         if outcome.state in ("paused", "canceled"):
-            return f"{subject} {outcome.state}. Completed tiles are saved. {resume}"
-        if outcome.state == "quota_limited":
-            return f"{quota_message(outcome.quota_reset, 'Resume')} Completed tiles are saved. {resume}"
-        if outcome.code == "AUTH_REQUIRED":
-            return f"{subject} requires Codex sign-in. Run codex login. {resume}"
-        return f"{subject} failed. {outcome.message or ''} {resume}"
+            message = f"{subject} {outcome.state}. Completed tiles are saved."
+        elif outcome.state == "quota_limited":
+            message = f"{quota_message(outcome.quota_reset, 'Resume')} Completed tiles are saved."
+        elif outcome.code == "AUTH_REQUIRED":
+            message = f"{subject} requires Codex sign-in. Run codex login."
+        else:
+            message = f"{subject} failed. {outcome.message or ''}".rstrip()
+        return f"{message} {resume}".rstrip()
 
     def _export(self, *, parts=False):
         job = self.job
@@ -2007,7 +2029,7 @@ class Window(QMainWindow):
 
         self._launch(
             "export_tiles" if parts else "export_image", save, self._export_finished,
-            lambda counts: self._file_progress(label, counts), message=f"{label}…",
+            lambda counts: self._file_progress(label, counts), message=f"{label}…", cancellable=True,
         )
 
     def _file_progress(self, label: str, counts: tuple[int, int]):
@@ -2022,7 +2044,7 @@ class Window(QMainWindow):
 
     def _set_feedback(
         self, message: str = "", *, busy: bool = False, progress: tuple[int, int] | None = None,
-        folder: Path | None = None,
+        folder: Path | None = None, recovery: tuple[str, Callable[[], None]] | None = None,
     ):
         self.task_status.setText(message)
         if progress is not None:
@@ -2032,9 +2054,21 @@ class Window(QMainWindow):
         elif busy:
             self.task_progress.setRange(0, 0)
         self.task_progress.setVisible(busy)
+        self.cancel_task.setVisible(busy and self.can_cancel_task)
+        self.cancel_task.setEnabled(busy and self.task is not None and not self.task.cancelled.is_set())
         self.output_folder = folder
         self.open_folder.setToolTip(str(folder) if folder is not None else "")
         self.open_folder.setVisible(folder is not None)
+        self.recover_task = None
+        if recovery is not None:
+            label, self.recover_task = recovery
+            self.retry_task.setText(label)
+        self.retry_task.setVisible(recovery is not None)
+        self.retry_task.setEnabled(self.task is None)
+
+    def _recover_task(self):
+        if self.task is None and self.recover_task is not None:
+            self.recover_task()
 
     def _report_progress(self, message: str, progress: tuple[int, int] | None = None):
         if self.task is not None and not (self.task.pause.is_set() or self.task.cancelled.is_set()):
@@ -2053,14 +2087,18 @@ class Window(QMainWindow):
 
     def _launch(
         self, name: str, operation, succeeded=None, updated=None, *, message: str,
-        progress: tuple[int, int] | None = None,
+        progress: tuple[int, int] | None = None, cancellable: bool = False, discard_on_cancel: bool = False,
     ):
         def complete(result):
+            if discard_on_cancel and self.task.cancelled.is_set():
+                self._set_feedback("Open canceled.")
+                return
             self._set_feedback()
             if succeeded is not None:
                 succeeded(result)
 
         self.operation = name
+        self.can_cancel_task = cancellable
         self.task = Task(operation, self)
         self.task.succeeded.connect(complete)
         if updated is not None:
@@ -2133,6 +2171,7 @@ class Window(QMainWindow):
         self.task = None
         self.operation = ""
         self.active = None
+        self.retry_task.setEnabled(self.recover_task is not None)
         after_task, self.after_task = self.after_task, None
         self._refresh()
         if self.closing:
