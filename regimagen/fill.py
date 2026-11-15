@@ -2,7 +2,6 @@
 
 import io
 import json
-import json
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -184,7 +183,7 @@ def _selection_coverage(
 
 def _selection_reference(
     reference: Image.Image, selected: np.ndarray, *, show_extent: bool = False,
-    placement: np.ndarray | None = None,
+    placement: np.ndarray | None = None, protected: np.ndarray | None = None,
 ) -> Image.Image:
     marked = reference_rgb(reference).copy()
     if show_extent:
@@ -195,6 +194,10 @@ def _selection_reference(
     if placement is not None and placement.any():
         inside = cv2.erode(placement, np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0)
         marked.paste((255, 174, 47), mask=Image.fromarray((placement != inside) & (inner != 0)))
+    if protected is not None:
+        # A guide pixel can overlap both sides of a source boundary. Keep the
+        # edit outline readable and show protection inside the adjacent area.
+        marked.paste((48, 234, 220), mask=Image.fromarray((protected & (selected == 0)) * np.uint8(92)))
     return marked
 
 
@@ -406,6 +409,10 @@ def _remove_prompt(labels: tuple[str, ...], *, alpha: bool, prepared: bool, clea
         "illumination so the reconstructed surface joins it continuously. "
         "Image 3 shows local and whole-image context. Use those views to infer what was behind "
         "the removed objects. Continue crossing lines, texture, surfaces, perspective and illumination. "
+        "Reconstruct the surface or scenery that the removed object was occluding. Keep existing "
+        "paths open. Continue paving through the former footprint when the surroundings show a "
+        "paved area. Keep adjacent buildings, planting beds and other fixed features in their "
+        "existing positions. Do not add new trees, planters, walls, curbs or decorations to fill the space. "
         "For repeated surfaces such as tiles, brick or paving, extend the existing rows and joints "
         "at their original positions, widths and angles through the missing area. Where an effect "
         "is marked, lift the cast shadow or remove the reflection while keeping the underlying "
@@ -595,6 +602,7 @@ def generate_remove(
     base: Image.Image, core: Image.Image, footprint: Image.Image, labels: Iterable[str],
     executable: Path | Callable[[], Path], *, cancelled: Event, client_factory=CodexClient, prepare: bool = True,
     direct: bool = False,
+    protected: Image.Image | None = None,
     prepare_crop: Callable[[Image.Image, np.ndarray, Rect, tuple[int, int]], Image.Image] | None = None,
 ) -> FillCandidate:
     if cancelled.is_set():
@@ -620,9 +628,18 @@ def generate_remove(
     tool_prompt = _remove_prompt(
         labels, alpha=base.mode == "RGBA", prepared=prepare, clear_restored=clear is not None,
     )
+    if protected is not None:
+        tool_prompt += (
+            " In Image 2, the cyan tint identifies protected foreground. Keep those original "
+            "shapes, colors, textures, and illumination. Connect the reconstructed surface "
+            "to the irregular foliage or other protected edges in place. Continue existing "
+            "ground right up to those edges. Avoid extra plants, loose rocks, steps or alterations "
+            "to adjacent buildings. The cyan tint is a guide and must be absent from the output."
+        )
     return _generate_edit(
         base, footprint, selection, tool_prompt, executable() if callable(executable) else executable,
         cancelled, client_factory, removal_core=core, prepare=prepare, prepare_crop=prepare_crop,
+        protected=protected,
     )
 
 
@@ -631,6 +648,7 @@ def _generate_edit(
     cancelled: Event, client_factory, *, removal_core: Image.Image | None = None, prepare: bool = False,
     prepare_crop: Callable[[Image.Image, np.ndarray, Rect, tuple[int, int]], Image.Image] | None = None,
     transition: int = 0, requested_edit: str = "", pattern: bool = False,
+    protected: Image.Image | None = None,
 ) -> FillCandidate:
     removal = removal_core is not None
     crop = Rect(0, 0, *base.size) if pattern else _crop_box(selection, base.size, fit_canvas=not removal)
@@ -650,7 +668,9 @@ def _generate_edit(
         directory = Path(folder)
         references = directory / "crop.png", directory / "selection.png", directory / "context.png"
         save_png(target, references[0])
-        save_png(_selection_reference(target, coverage, show_extent=removal, placement=placement), references[1])
+        keep = _selection_coverage(protected, crop) if protected is not None else None
+        save_png(_selection_reference(target, coverage, show_extent=removal, placement=placement, protected=keep),
+                 references[1])
         hide = removal_core if removal_core is not None else mask
         save_png(_context_reference(base, context_selection, crop, hide=hide if prepare else None,
                                     focus=bool(transition)), references[2])
@@ -779,24 +799,9 @@ def _match_pattern_context(
     if not context.any():
         return image
 
-    gray, edited_gray = (cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY) for pixels in (reference, aligned))
-    if min(size) >= 32 and gray[context].std() >= 5:
-        flow_solver = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-        flow_solver.setFinestScale(0)
-        flow = flow_solver.calc(gray, edited_gray, None)
-        warped_gray = cv2.remap(edited_gray, x + flow[..., 0], y + flow[..., 1], cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_REPLICATE)
-        gray_float = gray.astype(np.float32)
-        before, after = (cv2.GaussianBlur(abs(gray_float - pixels), (0, 0), 2)
-                         for pixels in (edited_gray, warped_gray))
-        valid = context & (np.linalg.norm(flow, axis=-1) <= 16) & (after + 2 < before)
-        flow_field, support = _pattern_context_field(flow, valid, sigma=8)
-        depth = cv2.distanceTransform(selected.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_5)
-        strength = _smoothstep(support / 0.12) * (1 - _smoothstep(depth / 30))
-        aligned = cv2.remap(
-            generated, x + dx + flow_field[..., 0] * strength, y + dy + flow_field[..., 1] * strength,
-            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
-        )
+    dx_field, dy_field = _local_displacement(reference, aligned, selected, context, x, y)
+    aligned = cv2.remap(generated, x + dx + dx_field, y + dy + dy_field,
+                        cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
     aligned = match_course_widths(reference, aligned, selected)
     source = cv2.cvtColor(reference.astype(np.float32) / 255, cv2.COLOR_RGB2LAB)
@@ -823,6 +828,44 @@ def _match_pattern_context(
     neutral = cv2.cvtColor(patch, cv2.COLOR_LAB2RGB)
     rgb = aligned.astype(np.float32) + (corrected - neutral) * 255
     return Image.fromarray(np.rint(np.clip(rgb, 0, 255)).astype(np.uint8))
+
+
+def _local_displacement(reference, aligned, selected, context, x, y):
+    gray, edited = (cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY) for pixels in (reference, aligned))
+    if min(gray.shape) < 32 or not context.any() or gray[context].std() < 5:
+        return 0, 0
+    solver = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    solver.setFinestScale(0)
+    flow = solver.calc(gray, edited, None)
+    warped = cv2.remap(edited, x + flow[..., 0], y + flow[..., 1], cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_REPLICATE)
+    gray = gray.astype(np.float32)
+    before, after = (cv2.GaussianBlur(abs(gray - pixels), (0, 0), 2) for pixels in (edited, warped))
+    valid = context & (np.linalg.norm(flow, axis=-1) <= 16) & (after + 2 < before)
+    field, support = _pattern_context_field(flow, valid, sigma=8)
+    depth = cv2.distanceTransform(selected.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_5)
+    strength = _smoothstep(support / 0.12) * (1 - _smoothstep(depth / 30))
+    return field[..., 0] * strength, field[..., 1] * strength
+
+
+def _align_removal_edges(
+    base: Image.Image, mask: Image.Image, image: Image.Image, crop: Rect,
+    shift: tuple[int, int], width: int,
+) -> Image.Image:
+    reference = np.asarray(_working_frame(base, crop, Image.Resampling.LANCZOS))
+    generated = np.asarray(image.resize((FRAME, FRAME), Image.Resampling.LANCZOS))
+    x, y = np.meshgrid(np.arange(FRAME, dtype=np.float32), np.arange(FRAME, dtype=np.float32))
+    dx, dy = shift
+    aligned = cv2.remap(generated, x + dx, y + dy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    selected = _selection_coverage(mask, crop) != 0
+    distance = cv2.distanceTransform((~selected).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_5)
+    cols, rows = _real_axes(crop, base.size)
+    context = (~selected & (distance <= max(8, width * FRAME / crop.width))
+               & cols[None, :] & rows[:, None])
+    side = _local_displacement(reference, aligned, selected, context, x, y)
+    corrected = cv2.remap(generated, x + dx + side[0], y + dy + side[1],
+                          cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(corrected)
 
 
 def _pattern_context_field(values, weight, *, sigma):
@@ -1141,9 +1184,12 @@ def render_fill(
         removal_width = removal_transition_width(replace_core.crop(bounds)) if base.mode == "RGB" and bounds else feather
     textured_removal = base.mode == "RGB" and removal_width >= 4
     tone_width = removal_width if textured_removal else transition
-    generated = (_match_context_tones(base, mask, candidate.image, crop, shift, tone_width,
-                                      textured=textured_removal)
-                 if tone_width else candidate.image)
+    generated = candidate.image
+    if textured_removal and removal_width >= 16:
+        generated = _align_removal_edges(base, mask, generated, crop, shift, removal_width)
+        shift = (0, 0)
+    if tone_width:
+        generated = _match_context_tones(base, mask, generated, crop, shift, tone_width, textured=textured_removal)
     if pattern and base.mode == "RGB":
         generated = _match_pattern_context(base, mask, generated, shift)
         if generated is not candidate.image:

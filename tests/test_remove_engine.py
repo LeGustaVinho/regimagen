@@ -88,6 +88,27 @@ def test_direct_lasso_sends_visible_subject_even_on_a_retry():
     assert np.any(np.all(np.asarray(references[0]) == (255, 0, 0), axis=2))
 
 
+def test_remove_references_mark_protection_without_covering_the_edit_guide():
+    base = Image.new("RGB", (500, 500), (24, 117, 81))
+    edit = Image.new("L", base.size)
+    edit.paste(255, (140, 140, 300, 300))
+    protected = Image.new("L", base.size)
+    protected.paste(255, (299, 155, 330, 246))
+    capture = _Capture()
+    for mask in (None, protected):
+        generate_remove(base, edit, edit, ("Building",), Path("codex"), cancelled=Event(),
+                        client_factory=capture, prepare=False, protected=mask)
+
+    (_, original), (prompt, marked) = capture.requests
+    assert "cyan tint identifies protected foreground" in prompt
+    assert marked[0].tobytes() == original[0].tobytes()
+    guide = np.asarray(original[1])
+    edited_guide = np.asarray(marked[1])
+    selected = np.any(guide != np.asarray(original[0]), axis=2)
+    assert np.array_equal(edited_guide[selected], guide[selected])
+    assert np.any(edited_guide[~selected] != guide[~selected])
+
+
 def test_removed_objects_keep_source_alpha_and_assign_shared_pixels_in_review_order():
     source = Image.new("RGBA", (18, 16), (0, 0, 0, 0))
     source.paste((92, 130, 185, 141), (3, 3, 15, 13))
@@ -107,6 +128,28 @@ def test_removed_objects_keep_source_alpha_and_assign_shared_pixels_in_review_or
     assert b.image.getpixel((3, 0)) == (92, 130, 185, 141)
     assert b.image.getpixel((0, 5)) == (92, 130, 185, 141)
     assert a.visible and b.visible and a.coverage is None and b.coverage is None
+
+
+def test_object_matte_is_soft_but_edge_cleanup_is_full_strength():
+    source = Image.new("RGB", (88, 88), (40, 70, 120))
+    source.paste((230, 150, 30), (20, 20, 60, 60))
+    matte = Image.new("L", (40, 40), 255)
+    matte.paste(80, (0, 0, 1, 40))
+    target = RemovalTarget("Facade", matte, (20, 20), edge_cleanup=4)
+    excluded = Image.new("L", source.size)
+    excluded.putpixel((18, 34), 255)
+    inputs = removal_masks(source.size, (target,), excluded=excluded, source=source)
+    layer, = removed_object_layers(source, inputs.core, inputs.objects, cancelled=Event())
+
+    assert layer.image.getpixel((0, 10))[3] == 80
+    assert layer.image.getpixel((1, 10)) == (*source.getpixel((21, 30)), 255)
+    assert layer.image.size == matte.size
+    assert inputs.core.getpixel((18, 30)) == 255
+    assert inputs.footprint.getpixel((18, 34)) == 0
+    output = render_remove(source, inputs.core, inputs.footprint, _candidate(
+        Image.new("RGB", source.size, (40, 70, 120)),
+    )).compose(source)
+    assert output.getpixel((20, 30)) == output.getpixel((18, 30)) == (40, 70, 120)
 
 
 def test_approved_footprint_and_protected_hole_are_exact_at_source_resolution():

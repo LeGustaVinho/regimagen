@@ -935,9 +935,12 @@ class Window(QMainWindow):
             approved, objects = prepared
             if cancel.is_set():
                 raise Cancelled("Removal canceled.")
+            guide = {"protected": approved.protected} if approved.protected is not None and any(
+                target.edge_cleanup for target in approved.objects
+            ) else {}
             candidate = generate_remove(
                 image, approved.core, approved.footprint, approved.labels, executable,
-                cancelled=cancel, prepare=prepare, direct=approved.direct,
+                cancelled=cancel, prepare=prepare, direct=approved.direct, **guide,
             )
             preview = render_remove(image, approved.core, approved.footprint, candidate)
             if approved.warning:

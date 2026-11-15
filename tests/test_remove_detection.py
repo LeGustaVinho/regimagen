@@ -6,7 +6,8 @@ from PIL import Image
 
 from regimagen.codex import Cancelled, CodexError
 from regimagen.geometry import Rect
-from regimagen.remove_detection import RemovalTarget, _guide, detect_removal, detect_removal_effects
+from regimagen.remove_detection import RemovalTarget, _guide, _review_coordinates, detect_removal, detect_removal_effects
+from regimagen.remove_matte import refine_occlusion
 
 
 def _outline(label, bounds, *, view="overview", uncertain=False):
@@ -127,6 +128,92 @@ def test_detection_ignores_contours_in_the_gap_between_lasso_components():
     })
 
     assert not detect_removal(base, lasso, Path("codex"), cancelled=Event(), client_factory=client)
+
+
+def test_refined_silhouette_keeps_attached_wire_and_its_gap():
+    base = Image.new("RGB", (360, 350), (29, 58, 80))
+    base.paste((224, 183, 103), (100, 135, 280, 303))
+    base.paste((240, 182, 37), (100, 83, 103, 137))
+    base.paste((63, 76, 108), (121, 147, 134, 159))
+    lasso = Image.new("L", base.size)
+    lasso.paste(255, (70, 58, 294, 316))
+
+    class Selection(_FakeAnalysis):
+        def analyze_images(self, prompt, references, schema, *, effort=None):
+            if "gaps" in schema["properties"] and "parts" not in schema["properties"]:
+                assert effort == "low"
+                assert [path.name for path in references] == ["upper.png", "upper-outline.png"]
+                self.calls += 1
+                return {"gaps": [_outline("Visible background", [204, 550, 259, 622], view="upper")]}
+            if "parts" not in schema["properties"]:
+                return super().analyze_images(prompt, references, schema)
+            assert effort == "low"
+            assert [path.name for path in references] == ["silhouette.png", "silhouette-outline.png", "contact.png"]
+            self.calls += 1
+            return {
+                "parts": [_outline("Facade", [122, 292, 883, 894], view="detail")],
+                "gaps": [],
+                "foreground": [],
+                "wires": [{"path": [[124, 104], [124, 300]], "width": 11}],
+                "attached": ["Cord"],
+            }
+
+    subject = _outline("Building", [270, 385, 780, 865])
+    cord = _outline("Cord", [278, 234, 285, 402])
+    client = Selection({"targets": [{**subject, "effects": []}, {**cord, "effects": []}], "protected": []})
+    targets = detect_removal(base, lasso, Path("codex"), cancelled=Event(), client_factory=client)
+    assert client.calls == 3 and len(targets) == 1
+    target = targets[0]
+    x, y = target.origin
+    assert target.mask.getpixel((101-x, 110-y)) > 128
+    assert target.mask.getpixel((135-x, 110-y)) == 0
+    assert target.mask.getpixel((126-x, 152-y)) == 0
+    assert target.mask.getpixel((147-x, 152-y)) == 255
+
+
+def test_occlusion_requires_visible_foreground_seeds():
+    base = Image.new("RGB", (64, 48), (120, 106, 75))
+    base.paste((25, 116, 48), (4, 18, 29, 31))
+    subject = Image.new("L", base.size)
+    subject.paste(255, (20, 3, 59, 45))
+    proposal = Image.new("L", base.size)
+    proposal.paste(255, (19, 18, 38, 31))
+    assert refine_occlusion(base, proposal, subject, 7).getbbox() is None
+
+    proposal.paste(255, (8, 18, 19, 31))
+    protected = refine_occlusion(base, proposal, subject, 7)
+    assert protected.getpixel((24, 22)) == 255
+    assert protected.getpixel((34, 22)) == 0
+
+
+def test_codex_points_separate_an_occluder_entirely_inside_the_silhouette():
+    base = Image.new("RGB", (64, 48), (184, 130, 78))
+    base.paste((43, 101, 37), (25, 18, 36, 30))
+    subject = Image.new("L", base.size)
+    subject.paste(255, (16, 3, 59, 45))
+    proposal = Image.new("L", base.size)
+    proposal.paste(255, (22, 15, 41, 34))
+
+    protected = refine_occlusion(base, proposal, subject, 7, keep_points=((30, 23), (26, 20)),
+                                 object_points=((38, 24), (24, 25)))
+
+    assert protected.getpixel((31, 24)) == 255
+    assert protected.getpixel((26, 28)) == 255
+    assert protected.getpixel((37, 24)) == 0
+    assert protected.getpixel((24, 24)) == 0
+
+
+def test_foreground_review_accepts_fractional_and_integer_coordinate_scales():
+    fractional = {
+        **_outline("Plant", [0.16, 0.42, 0.29, 0.59], view="contact"),
+        "keep_points": [[0.18, 0.43]], "object_points": [[0.21, 0.4]],
+    }
+    integer = {
+        **_outline("Plant", [160, 420, 290, 590], view="contact"),
+        "keep_points": [[180, 430]], "object_points": [[210, 400]],
+    }
+    assert _review_coordinates(fractional) == integer
+    assert _review_coordinates(integer) == integer
 
 
 def test_click_uses_codex_and_clips_the_contour_to_visible_pixels():

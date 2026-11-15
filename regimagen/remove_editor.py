@@ -32,6 +32,7 @@ class RemovalInputs:
     direct: bool
     warning: str = ""
     excluded: Image.Image | None = None
+    protected: Image.Image | None = None
 
     def with_detected_objects(self, source: Image.Image, targets: tuple[RemovalTarget, ...]) -> RemovalInputs | None:
         approved = removal_masks(
@@ -110,6 +111,7 @@ def removal_masks(
     protected = protected.point(_BINARY)
     core = ImageChops.subtract(manual.point(_BINARY), protected) if manual is not None else Image.new("L", size)
     objects = {}
+    cleanup = []
     for index, target in enumerate(targets):
         if target.protected or target.parent is not None or index not in checked:
             continue
@@ -120,6 +122,16 @@ def removal_masks(
         if visible.getbbox() is not None:
             _union_target(core, replace(target, mask=mask))
             objects[index] = target
+            if opaque and target.edge_cleanup and object_limit is None:
+                # Pixels in this margin can contain part of the old silhouette.
+                # Rebuild them fully, without placing them on the object layer.
+                radius = target.edge_cleanup
+                left, top, right, bottom = area
+                bounds = (max(0, left - radius), max(0, top - radius),
+                          min(size[0], right + radius), min(size[1], bottom + radius))
+                local = Image.new("L", (bounds[2] - bounds[0], bounds[3] - bounds[1]))
+                local.paste(mask, (left - bounds[0], top - bounds[1]))
+                cleanup.append(replace(target, mask=_expand_mask(local, radius), origin=bounds[:2]))
 
     if not objects and manual is None:
         return None
@@ -130,6 +142,8 @@ def removal_masks(
             # A fully excluded caster leaves its shadow in the scene.
             _union_target(protected, target, excluding=core.crop(_target_bounds(target)))
     for target in effects.values():
+        _union_target(core, target)
+    for target in cleanup:
         _union_target(core, target)
     protected = protected.point(_BINARY)
     core = ImageChops.subtract(core.point(_BINARY), protected)
@@ -169,7 +183,10 @@ def removal_masks(
             labels.append(target.label)
         elif index in effects and ImageChops.darker(core.crop(_target_bounds(target)), target.mask).getbbox() is not None:
             labels.append(target.label)
-    return RemovalInputs(core, footprint, tuple(labels), tuple(objects.values()), manual is not None, excluded=excluded)
+    return RemovalInputs(
+        core, footprint, tuple(labels), tuple(objects.values()), manual is not None,
+        excluded=excluded, protected=protected if protected.getbbox() is not None else None,
+    )
 
 
 def _outline(mask: Image.Image, origin: tuple[int, int] = (0, 0)) -> QPainterPath:

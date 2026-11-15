@@ -10,6 +10,7 @@ from .document import Document, Layer, box, paste_pixels, render
 from .fill import FillCandidate, FillPreview, render_fill
 from .geometry import Rect
 from .remove_detection import RemovalTarget
+from .remove_matte import clean_matte_colors
 
 
 def fill_reference(image: Image.Image) -> Image.Image:
@@ -66,7 +67,7 @@ def removed_object_layers(
         if overlap is None:
             continue
         region = box(overlap.relative_to(origin))
-        subject = target.mask.crop(box(overlap.relative_to(bounds))).point([0] + [255] * 255)
+        subject = target.mask.crop(box(overlap.relative_to(bounds)))
         mask = ImageChops.darker(available.crop(region), subject)
         selected = mask.getbbox()
         if selected is None:
@@ -74,16 +75,19 @@ def removed_object_layers(
         x, y = overlap.left, overlap.top
         left, top, right, bottom = selected
         patch = source.crop((x + left, y + top, x + right, y + bottom)).convert("RGBA")
-        alpha = ImageChops.multiply(patch.getchannel("A"), mask.crop(selected))
+        coverage = mask.crop(selected)
+        alpha = ImageChops.multiply(patch.getchannel("A"), coverage)
         visible = alpha.getbbox()
         if visible is None:
             continue
+        if source.mode == "RGB":
+            patch = clean_matte_colors(patch, coverage)
         patch.putalpha(alpha)
         patch = patch.crop(visible)
         clear = patch.getchannel("A").point([255] + [0] * 255)
         patch.paste((0, 0, 0, 0), (0, 0, *patch.size), clear)
         layers.append(Layer(target.label, patch, x + left + visible[0], y + top + visible[1]))
-        available.paste(0, region, mask)
+        available.paste(0, region, mask.point([0] + [255] * 255))
     if cancelled.is_set():
         raise Cancelled("Removal canceled.")
     return tuple(layers)
