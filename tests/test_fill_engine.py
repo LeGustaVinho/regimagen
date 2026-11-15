@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
-from regimagen import remove_detection
+from regimagen import fill_foreground
 from regimagen.codex import Cancelled, GeneratedImage
 from regimagen.fill import SELECTION_MARK, FillCandidate, generate_fill, render_fill
 from regimagen.geometry import FRAME
@@ -265,7 +265,7 @@ def test_transparent_fill_isolates_the_subject_if_imagegen_retains_scenery(monke
             matte[y - 1:y + 2, x + 4:x + 7] = 0
             return matte
 
-    monkeypatch.setattr(remove_detection, "_EfficientSAM", Segmenter)
+    monkeypatch.setattr(fill_foreground, "_EfficientSAM", Segmenter)
     client = Client(lambda *_: _png(generated))
     candidate = generate_fill(base, selection, prompt, False, Path("codex"), cancelled=Event(),
                               client_factory=client)

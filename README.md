@@ -5,7 +5,7 @@
 [![CLI JSON schema v1](https://img.shields.io/badge/CLI-JSON%20v1-2EA043)](docs/CLI.md)
 [![Python 3.14](https://img.shields.io/badge/Python-3.14-3776AB?logo=python&logoColor=white)](#develop-from-source)
 
-**Layered image editing and generative reconstruction with Codex ImageGen.** Compose and retouch images in the Windows app, use Generative Fill or Generative Remove on a selection, or reconstruct the visible composition at a larger size. The JSON CLI automates reconstruction and tile export.
+**Layered image editing and generative reconstruction with Codex ImageGen.** Compose and retouch images in the Windows app, use Generative Fill on a selection, or reconstruct the visible composition at a larger size. The JSON CLI automates reconstruction and tile export.
 
 [Download Windows ZIP](https://github.com/LeGustaVinho/regimagen/releases/latest/download/Regimagen-Windows-x64.zip) · [CLI reference](docs/CLI.md) · [Report an issue](https://github.com/LeGustaVinho/regimagen/issues/new)
 
@@ -19,7 +19,6 @@
 - **Manual retouching.** Paint pixels or masks with the brush and eraser. Rotate, flip, and resize layers, or preview brightness, contrast, and saturation adjustments. Undo and redo edits in the current session. Export the composition as PNG or WebP with transparency, or JPEG with a white background.
 - **Repeating patterns.** Use **View → Pattern Preview** to see the canvas repeat as you edit the center tile. **Filter → Other → Offset** shifts the active layer with wraparound. **Filter → Fix Pattern Seams** uses Codex to propose a seam mask and Generative Fill to repair it. [Pattern workflow](#repeating-patterns)
 - **Generative Fill.** Choose **New layer** to use the visible composition, or **Active layer** to edit a visible, unlocked raster layer. Select an area, describe the edit, and compare variations before applying. Use **Subtract** to trim the selected variation locally. A prompt for a transparent background creates a cutout on **New layer**. You can also enable **Edit Transparency** to allow coverage changes. To reduce the selection of a previously saved image version, open it from **Recent** and choose **Image version → Reopen fill**.
-- **Generative Remove.** Reconstruct the background and keep each removed object as a movable layer with transparency. Use **Click**, **Lasso**, or **Direct Lasso** to identify the objects. [Generative Remove workflow](#generative-remove)
 - **Configurable reconstruction.** Choose at least 2 columns and 2 rows. Regimagen previews the output size and tile count before generation and suggests the smallest grid that can fit at least 2× the source dimensions.
 - **Reusable 2×2 previews.** Check a four-tile region before running the full grid. The full job reuses completed tiles from the same grid.
 - **Art direction and review.** Set a global prompt and per-tile overrides, inspect seams with synchronized zoom, and regenerate individual tiles.
@@ -34,17 +33,8 @@ Use the preview and seam review to check generated tiles before committing to a 
 1. [Download the portable Windows ZIP](https://github.com/LeGustaVinho/regimagen/releases/latest/download/Regimagen-Windows-x64.zip) and extract the whole folder. Keep `_internal` beside the executables. The ZIP bundles the Python runtime and application dependencies. [Build from source](#develop-from-source) to try changes on a development branch.
 2. Open `Regimagen.exe` on Windows 10 or 11 x64. Drop in a still PNG, JPEG, WebP, or `.regimagen` project. To start from transparency, choose **New canvas**. Use **Cancel** in the task bar to stop opening a file and keep the current document.
 3. Use **Add layer** to import another image or create a paintable layer. Choose **File → Save project** to keep your layers, or **File → Export image** to publish the composition.
-4. Install Codex CLI and run `codex login` for **Generative Fill**, **Reconstruct**, and the parts of **Generative Remove** that use visual analysis or background reconstruction. If automatic detection misses it, choose the executable from the **Codex CLI** menu. [Codex CLI documentation](https://developers.openai.com/codex/cli/)
+4. Install Codex CLI and run `codex login` for **Generative Fill** and **Reconstruct**. If automatic detection misses it, choose the executable from the **Codex CLI** menu. [Codex CLI documentation](https://developers.openai.com/codex/cli/)
 5. In **Reconstruct**, run **Generate 2×2 preview**, inspect the result, then choose **Generate image**. If a run is interrupted, use the retry action in the task bar to resume the same region. Use **Open result in editor** to work on the completed image at its generated size. You can also export the PNG or a ZIP of tiles.
-
-## Generative Remove
-
-1. Open **Generative Remove…** in the layered editor. Choose **Direct Lasso** and draw around the whole object, including thin details such as wires. If you already drew a selection, choose **Use Lasso directly**.
-2. Click **Remove**. Codex traces the object within the lasso and checks for effects such as its cast shadow. You can leave the shadow outside the lasso. The background repair follows confirmed effects past the outline and blends into the nearby surface.
-3. Inspect the repair in **Background**. **Before** shows the original and **After** shows the cutouts in their original positions over the repaired background. Use **Generate another** to try a different background with the same cutouts. If Codex is unsure which object you meant, adjust the lasso or choose **Review with Lasso**.
-4. Click **Apply** to add the **Generative Remove** background layer and a transparent layer for each object. The top object layer is selected. Use **Move** or hide the layer in **Layers** to reveal the repaired background. One undo reverses the entire removal. Use **File → Save project** to keep the layer positions, pixels, and visibility.
-
-To review the masks before generating, use **Click**, **Lasso**, or **Select with Codex** for an existing selection. Check the objects and effects to remove. **Add** extends the checked item you select in the list. **Subtract** protects the marked area, and **Regenerate selection** keeps those exclusions when it retraces the objects. For large objects, Regimagen checks the silhouette in a closer view, uses a separate close-up to distinguish overlapping foreground at the base, and refines the edges against the original pixels. The cutout keeps partial alpha at the edges. The background layer repairs shadows, reflections, and a narrow margin around the silhouette to clear remnants and blend into the original texture. Regimagen restores clear background locally where the selected object is surrounded by transparency.
 
 ## Repeating patterns
 
@@ -77,7 +67,7 @@ uv run pytest -q
 
 The test suite covers the editor, generative selection and compositing, portable projects, saved-job compatibility, and CLI recovery using simulated ImageGen results. The optional `tools/validate_imagegen.py` script runs a live check and uses your Codex quota. See `--help` for its options.
 
-Build the portable archive with `.\tools\build-portable.ps1`. The build prepares and verifies the pinned EfficientSAM model, then writes `dist\Regimagen-Windows-x64.zip` with the desktop app, CLI, model, and documentation. Pass `-DistSubdirectory NAME` to write the archive under `dist\NAME`. To prepare the model ahead of a source run, use `uv run python -m regimagen.remove_model`.
+Build the portable archive with `.\tools\build-portable.ps1`. The build prepares and verifies the pinned EfficientSAM model for Generative Fill cutouts, then writes `dist\Regimagen-Windows-x64.zip` with the desktop app, CLI, model, and documentation. Pass `-DistSubdirectory NAME` to write the archive under `dist\NAME`. To prepare the model ahead of a source run, use `uv run python -m regimagen.segmentation_model`.
 
 ## Third-party components
 

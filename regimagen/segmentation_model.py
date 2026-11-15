@@ -1,4 +1,4 @@
-"""Locate or prepare the pinned EfficientSAM model for Generative Remove."""
+"""Locate or prepare the pinned EfficientSAM model for Generative Fill cutouts."""
 
 import sys
 from hashlib import file_digest, sha256

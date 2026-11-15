@@ -2,7 +2,7 @@
 
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import file_digest
 from pathlib import Path
@@ -25,12 +25,12 @@ from .codex import AuthRequired, Cancelled, CodexError, QuotaPaused, find_codex
 from .composite import export_parts, export_png
 from .document import Document, Layer, box, export_document, render
 from .document_fill import (
-    ActiveFillTarget, LayeredVariant, RemovalVariant, active_fill_target, fill_reference, layered_variant,
-    removal_variant, removed_object_layers, render_layer_fill, replacement_layer,
+    ActiveFillTarget, LayeredVariant, active_fill_target, fill_reference,
+    render_layer_fill, replacement_layer,
 )
 from .editor import Editor, dimensions
 from .files import atomic_output, load_source
-from .fill import FillCandidate, FillPreview, generate_fill, generate_remove, render_fill, render_remove
+from .fill import FillCandidate, FillPreview, generate_fill, render_fill
 from .fill_editor import FillEditor
 from .geometry import (
     DEFAULT_SCALES, MAX_PNG_DIMENSION, MIN_COLUMNS, MIN_ROWS, Cell, Grid, Layout, plan_scales, suggested_grid,
@@ -40,8 +40,6 @@ from .pattern import check_pattern_joins, detect_pattern_seams, repair_pattern
 from .pattern_editor import PatternEditor, PatternSession, PatternVariant
 from .periodic import wrap_offset
 from .project import PROJECT_SUFFIX, load_project, save_project
-from .remove_detection import detect_removal, detect_removal_effects
-from .remove_editor import RemovalInputs, RemoveEditor
 from .storage import FillEdit, Job, Snapshot, Source, Store, Tile
 from .viewer import Comparison, qimage
 
@@ -112,15 +110,6 @@ class LayerFillSession:
     target: ActiveFillTarget | None
     variants: list[LayeredVariant] = field(default_factory=list)
     applying: bool = False
-
-
-@dataclass
-class RemoveSession(LayerFillSession):
-    prepared: tuple[RemovalInputs, tuple[Layer, ...]] | None = None
-
-    def clear_variants(self):
-        self.variants.clear()
-        self.prepared = None
 
 
 @dataclass
@@ -429,7 +418,6 @@ class Window(QMainWindow):
         self.editor.import_requested.connect(self._import_layer)
         self.editor.reconstruct_requested.connect(self._reconstruct)
         self.editor.fill_requested.connect(self._open_layer_fill)
-        self.editor.remove_requested.connect(lambda: self._open_layer_fill(remove=True))
         self.stack.addWidget(self.editor)
         self.sidebar = self._sidebar()
         workspace.addWidget(self.sidebar)
@@ -701,10 +689,10 @@ class Window(QMainWindow):
 
         self._launch("open_fill", load, show, message="Opening Generative Fill…")
 
-    def _open_layer_fill(self, *, remove=False):
+    def _open_layer_fill(self):
         if self.task is not None or self.stack.currentWidget() is not self.editor:
             return
-        if self._after_editor_edits(lambda: self._open_layer_fill(remove=remove)):
+        if self._after_editor_edits(self._open_layer_fill):
             return
         document, layer, selection = self.editor.document, self.editor.active_layer, self.editor.selection
         if document is None:
@@ -712,35 +700,25 @@ class Window(QMainWindow):
 
         def load(_update, _pause, cancel):
             image = fill_reference(render(document, cancelled=cancel.is_set))
-            return image, None if remove else active_fill_target(document, layer)
+            return image, active_fill_target(document, layer)
 
         def show(loaded):
             if loaded is None or self.closing:
                 return
             image, target = loaded
             active = (target.image, box(target.area)) if target is not None else None
-            if remove:
-                editor = RemoveEditor(image, mask=selection)
-                editor.detect_requested.connect(self._detect_remove)
-                editor.generate_requested.connect(self._generate_remove)
-            else:
-                editor = FillEditor(image, mask=selection, layered=True, active_target=active)
-                editor.generate_requested.connect(self._generate_fill)
+            editor = FillEditor(image, mask=selection, layered=True, active_target=active)
+            editor.generate_requested.connect(self._generate_fill)
             editor.set_busy(True)
-            session_type = RemoveSession if remove else LayerFillSession
-            session = self.layer_fill = session_type(document, editor, target)
+            self.layer_fill = LayerFillSession(document, editor, target)
             editor.cancel_requested.connect(self._cancel_fill)
             editor.apply_requested.connect(self._apply_layer_fill)
             editor.discard_requested.connect(self._close_layer_fill)
-            if isinstance(session, RemoveSession):
-                editor.changed.connect(session.clear_variants)
-            else:
-                editor.changed.connect(self._layer_fill_changed)
+            editor.changed.connect(self._layer_fill_changed)
             self.stack.addWidget(editor)
             self.stack.setCurrentWidget(editor)
 
-        name = "Generative Remove" if remove else "Generative Fill"
-        self._launch("open_fill", load, show, message=f"Opening {name}…")
+        self._launch("open_fill", load, show, message="Opening Generative Fill…")
 
     def _open_pattern(self):
         if not self._can_open() or self.stack.currentWidget() is not self.editor:
@@ -857,143 +835,21 @@ class Window(QMainWindow):
         editor.deleteLater()
         self._refresh()
 
-    def _remove_session(self):
-        session = self.layer_fill
-        if self.task is not None or not isinstance(session, RemoveSession) or session.applying:
-            return None
-        if session.document is not self.editor.document:
-            self._close_layer_fill()
-            self.editor.set_message("The document changed. Open Generative Remove again to use the current image.")
-            return None
-        return session
-
-    def _detect_remove(self):
-        session = self._remove_session()
-        if session is None:
-            return
-        editor = session.editor
-        image, _ = editor.generation_input()
-        selection, points = editor.detection_mask, editor.detection_points
-        inputs = editor.removal_inputs()
-        if inputs is not None and inputs.direct:
-            selection = inputs.core
-        if not points and selection.getbbox() is None:
-            return
-        executable = self._codex_resolver()
-
-        def detect(_update, _pause, cancel):
-            path = executable()
-            point = points[0] if points else None
-            targets = detect_removal(image, selection, path, point=point, cancelled=cancel)
-            try:
-                targets = detect_removal_effects(image, targets, path, cancelled=cancel)
-            except Cancelled:
-                raise
-            except CodexError as error:
-                return targets, f"Could not check for cast shadows or reflections. {error}"
-            return targets, ""
-
-        def show(result):
-            if not self.closing:
-                targets, message = result
-                editor.set_targets(targets, detailed=True)
-                if message:
-                    editor.set_message(message)
-
-        self._launch("detect_remove", detect, show, message="Selecting with Codex…")
-
-    def _generate_remove(self):
-        session = self._remove_session()
-        if session is None:
-            return
-        inputs = session.editor.removal_inputs()
-        if inputs is None:
-            return
-        image, _ = session.editor.generation_input()
-        executable = self._codex_resolver()
-        prepare = len(session.variants) % 2 == 1
-        cached = session.prepared
-
-        def generate(update, _pause, cancel):
-            prepared = cached
-            if prepared is None:
-                approved = inputs
-                if inputs.direct:
-                    path = executable()
-                    targets = detect_removal(image, inputs.core, path, direct=True, cancelled=cancel)
-                    if any(not target.selected and not target.protected and target.parent is None for target in targets):
-                        raise CodexError("Codex returned an uncertain object. Try again or choose Review with Lasso.")
-                    targets = detect_removal_effects(image, targets, path, cancelled=cancel, lasso=inputs.core)
-                    approved = inputs.with_detected_objects(image, targets)
-                    if approved is None:
-                        raise CodexError("Codex could not isolate an object. Try again or choose Review with Lasso.")
-                objects = removed_object_layers(image, approved.core, approved.objects, cancelled=cancel)
-                if not objects:
-                    raise CodexError("No visible objects in the selection. Adjust the selection and try again.")
-                prepared = approved, objects
-                update(prepared)
-            approved, objects = prepared
-            if cancel.is_set():
-                raise Cancelled("Removal canceled.")
-            guide = {"protected": approved.protected} if approved.protected is not None and any(
-                target.edge_cleanup for target in approved.objects
-            ) else {}
-            candidate = generate_remove(
-                image, approved.core, approved.footprint, approved.labels, executable,
-                cancelled=cancel, prepare=prepare, direct=approved.direct, **guide,
-            )
-            preview = render_remove(image, approved.core, approved.footprint, candidate)
-            if approved.warning:
-                preview = replace(preview, warning=" ".join(filter(None, (approved.warning, preview.warning))))
-            if cancel.is_set():
-                raise Cancelled("Removal canceled.")
-            return removal_variant(session.document, approved.footprint, preview, objects, cancelled=cancel)
-
-        def prepared(result):
-            session.prepared = result
-            self._set_feedback("Reconstructing the background…", busy=True)
-
-        message = "Isolating objects with Codex…" if inputs.direct and cached is None else "Removing selected area…"
-        self._launch("generate_remove", generate, self._append_remove_variant, prepared, message=message)
-
-    def _append_remove_variant(self, variant: RemovalVariant):
-        session = self.layer_fill
-        if not isinstance(session, RemoveSession) or self.closing:
-            return
-        # The result may have been queued before the Cancel click reached the window.
-        if self.task is not None and self.task.cancelled.is_set():
-            message = "Removal canceled."
-            session.editor.set_message(message)
-            self._set_feedback(message)
-            return
-        self._append_layer_variant(variant)
-
     def _append_layer_variant(self, variant: LayeredVariant):
         session = self.layer_fill
         if session is None or self.closing:
             return
         session.variants.append(variant)
-        if isinstance(variant, RemovalVariant):
-            session.editor.add_removal_variant(variant.preview, variant.background)
-        else:
-            session.editor.add_variant(variant.preview)
+        session.editor.add_variant(variant.preview)
 
     def _apply_layer_fill(self):
         session = self.layer_fill
         if session is None or session.applying or self.task is not None or not session.editor.can_apply:
             return
-        if isinstance(session.editor, RemoveEditor):
-            if self._remove_session() is None:
-                return
         variant = session.variants[session.editor.selected_variant]
-        if isinstance(variant, RemovalVariant):
-            count = len(variant.document.layers) - len(session.document.layers) - 1
-            objects = "1 object layer" if count == 1 else f"{count} object layers"
-            message = f"Applied Generative Remove and {objects}. Undo with Ctrl+Z."
-        else:
-            layer = variant.document.layer(variant.layer_id)
-            destination = "the active layer" if session.document.layer(variant.layer_id) is not None else "a new layer"
-            message = f"Applied to {destination} “{layer.name}”. Undo with Ctrl+Z."
+        layer = variant.document.layer(variant.layer_id)
+        destination = "the active layer" if session.document.layer(variant.layer_id) is not None else "a new layer"
+        message = f"Applied to {destination} “{layer.name}”. Undo with Ctrl+Z."
         session.applying = True
         self.editor.set_message("")
         self._set_feedback("Applying variation…", busy=True)
@@ -1010,10 +866,7 @@ class Window(QMainWindow):
                 self._set_feedback("Could not apply the variation.")
                 self._refresh()
 
-        if isinstance(variant, RemovalVariant):
-            self.editor.apply_removal(variant.document, variant.layer_id)
-        else:
-            self.editor.apply_fill(variant.document, variant.layer_id, session.editor.mask)
+        self.editor.apply_fill(variant.document, variant.layer_id, session.editor.mask)
         if not self.editor.after_edits(applied):
             applied()
 
@@ -1103,7 +956,7 @@ class Window(QMainWindow):
         self._launch("generate_fill", generate, append, message="Generating variation…")
 
     def _cancel_fill(self):
-        if self.task is not None and self.operation in ("generate_fill", "detect_remove", "generate_remove"):
+        if self.task is not None and self.operation == "generate_fill":
             self._request_cancel()
 
     def _apply_fill(self):
@@ -1626,13 +1479,7 @@ class Window(QMainWindow):
         if session is not None:
             cancelling = busy and self.task.cancelled.is_set()
             busy = busy or (self.layer_fill is not None and self.layer_fill.applying)
-            if isinstance(session.editor, RemoveEditor):
-                session.editor.set_busy(
-                    busy, generating=self.operation == "generate_remove", detecting=self.operation == "detect_remove",
-                    cancelling=cancelling,
-                )
-            else:
-                session.editor.set_busy(busy, generating=self.operation == "generate_fill", cancelling=cancelling)
+            session.editor.set_busy(busy, generating=self.operation == "generate_fill", cancelling=cancelling)
             return
         if not comparing:
             return
@@ -2137,7 +1984,6 @@ class Window(QMainWindow):
             if session is not None:
                 session.editor.set_message(detail)
                 message = {
-                    "detect_remove": "Object detection failed.",
                     "detect_pattern": "Seam detection failed.",
                     "generate_pattern": "Pattern repair failed.",
                 }.get(self.operation, "Could not complete the edit.")

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from PyInstaller.utils.hooks import copy_metadata
-from regimagen.remove_model import model_path
+from regimagen.segmentation_model import model_path
 
 
 root = Path(SPECPATH).parent

@@ -121,7 +121,6 @@ class Editor(QWidget):
     import_requested = Signal()
     reconstruct_requested = Signal()
     fill_requested = Signal()
-    remove_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -190,10 +189,8 @@ class Editor(QWidget):
         tools.addWidget(_button("Fit", self.canvas.fit))
         tools.addWidget(_button("100%", self.canvas.actual_size, tip="Show pixels at actual size"))
         self.fill_button = _button("Generative Fill…", self.fill_requested)
-        self.remove_button = _button("Generative Remove…", self.remove_requested)
         self.reconstruct_button = _button("Reconstruct…", self.reconstruct_requested)
         tools.addWidget(self.fill_button)
-        tools.addWidget(self.remove_button)
         tools.addWidget(self.reconstruct_button)
         content.addLayout(tools)
 
@@ -485,9 +482,6 @@ class Editor(QWidget):
             self._submit(
                 label, lambda _state: _State(document, layer_id, _Selection.prepare(selection)), background=True,
             )
-
-    def apply_removal(self, document: Document, layer_id: str):
-        self._submit("Generative Remove", lambda _state: _State(document, layer_id, None))
 
     def _submit(self, label, update, *, background=False, keep_gesture=False):
         if self._state is not None:

@@ -19,7 +19,7 @@ try {
     }
     $regimagenBuild = Join-Path $regimagenRoot 'build'
     New-Item -ItemType Directory -Path $regimagenBuild -Force | Out-Null
-    uv run python -m regimagen.remove_model
+    uv run python -m regimagen.segmentation_model
     if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the object selection model.' }
 
     $regimagenIcon = Join-Path $regimagenBuild 'Regimagen.ico'
